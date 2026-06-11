@@ -1,0 +1,6 @@
+.DS_Store
+.claude/
+.env.*
+deep-agents/static/charts/
+examples/
+venv/
