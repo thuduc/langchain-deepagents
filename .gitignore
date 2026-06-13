@@ -1,7 +1,6 @@
 .DS_Store
 .claude/
 .env.*
-deep-agents/static/charts/
 deep-agents-sdk/static/charts/
 deep-agents-sdk/__pycache__/
 examples/
