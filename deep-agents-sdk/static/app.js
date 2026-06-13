@@ -1,10 +1,56 @@
 document.addEventListener("DOMContentLoaded", () => {
+    // Theme Switcher Logic
+    const themeToggle = document.getElementById("theme-toggle");
+    
+    // Check saved theme or preferred system color theme
+    const savedTheme = localStorage.getItem("theme");
+    const systemPrefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    
+    if (savedTheme === "light" || (!savedTheme && !systemPrefersDark)) {
+        document.documentElement.setAttribute("data-theme", "light");
+    } else {
+        document.documentElement.setAttribute("data-theme", "dark");
+    }
+    
+    if (themeToggle) {
+        themeToggle.addEventListener("click", () => {
+            const currentTheme = document.documentElement.getAttribute("data-theme");
+            const newTheme = currentTheme === "light" ? "dark" : "light";
+            document.documentElement.setAttribute("data-theme", newTheme);
+            localStorage.setItem("theme", newTheme);
+        });
+    }
+
     const chatLog = document.getElementById("chat-log");
+    const welcomeScreen = document.getElementById("welcome-screen");
     const promptInput = document.getElementById("prompt-input");
     const sendBtn = document.getElementById("send-btn");
     const sessionIdDisplay = document.getElementById("session-id-display");
     const clearChatBtn = document.getElementById("clear-chat-btn");
-    const samplePrompts = document.querySelectorAll("#sample-prompts-list li");
+    const samplePrompts = document.querySelectorAll(".suggest-card");
+    const sidebar = document.getElementById("app-sidebar");
+    const menuBtn = document.getElementById("menu-btn");
+    const headerMenuBtn = document.getElementById("header-menu-btn");
+
+    // Collapsible Sidebar Toggling
+    function toggleSidebar() {
+        sidebar.classList.toggle("collapsed");
+    }
+
+    if (menuBtn) menuBtn.addEventListener("click", toggleSidebar);
+    if (headerMenuBtn) headerMenuBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        sidebar.classList.toggle("mobile-open");
+    });
+
+    // Close mobile sidebar on click outside
+    document.addEventListener("click", (e) => {
+        if (sidebar && sidebar.classList.contains("mobile-open")) {
+            if (!sidebar.contains(e.target) && e.target !== headerMenuBtn) {
+                sidebar.classList.remove("mobile-open");
+            }
+        }
+    });
 
     // Generate random session ID on startup
     const sessionId = "session-" + Math.random().toString(36).substring(2, 9);
@@ -37,13 +83,14 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    // Bind Clear Chat
+    // Bind Clear Chat / New Chat
     clearChatBtn.addEventListener("click", () => {
-        // Remove all except welcome message
-        const welcomeMsg = chatLog.querySelector(".system-message");
-        chatLog.innerHTML = "";
-        if (welcomeMsg) {
-            chatLog.appendChild(welcomeMsg);
+        // Remove all message bubbles
+        const messages = chatLog.querySelectorAll(".message");
+        messages.forEach(msg => msg.remove());
+        // Show welcome screen again
+        if (welcomeScreen) {
+            welcomeScreen.style.display = "flex";
         }
     });
 
@@ -56,6 +103,11 @@ document.addEventListener("DOMContentLoaded", () => {
         promptInput.value = "";
         promptInput.style.height = "auto";
         disableInput(true);
+
+        // Hide welcome screen immediately
+        if (welcomeScreen) {
+            welcomeScreen.style.display = "none";
+        }
 
         // Append user message to log
         appendMessage("user", text);
@@ -102,21 +154,25 @@ document.addEventListener("DOMContentLoaded", () => {
         const messageDiv = document.createElement("div");
         messageDiv.classList.add("message", `${sender}-message`);
 
-        const avatarDiv = document.createElement("div");
-        avatarDiv.classList.add("avatar");
-        if (sender === "user") {
-            avatarDiv.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`;
-        } else {
-            avatarDiv.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 0 1 7.54 16.59c.24.23.46.5.65.78l1.41 2.03a1 1 0 0 1-.82 1.6H3.22a1 1 0 0 1-.82-1.6l1.41-2.03c.19-.28.41-.55.65-.78A10 10 0 0 1 12 2z"/><path d="M12 12v.01"/><path d="M16 12v.01"/><path d="M8 12v.01"/></svg>`;
-        }
-
         const contentDiv = document.createElement("div");
         contentDiv.classList.add("msg-content");
         contentDiv.innerHTML = parseMarkdown(text);
 
-        messageDiv.appendChild(avatarDiv);
+        if (sender === "assistant") {
+            const avatarDiv = document.createElement("div");
+            avatarDiv.classList.add("avatar");
+            // Gemini spark star svg icon
+            avatarDiv.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>`;
+            messageDiv.appendChild(avatarDiv);
+        }
+
         messageDiv.appendChild(contentDiv);
         chatLog.appendChild(messageDiv);
+        
+        // Hide welcome screen when message appended
+        if (welcomeScreen) {
+            welcomeScreen.style.display = "none";
+        }
         
         // Auto scroll
         chatLog.scrollTop = chatLog.scrollHeight;
@@ -131,7 +187,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const avatarDiv = document.createElement("div");
         avatarDiv.classList.add("avatar");
-        avatarDiv.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 0 1 7.54 16.59c.24.23.46.5.65.78l1.41 2.03a1 1 0 0 1-.82 1.6H3.22a1 1 0 0 1-.82-1.6l1.41-2.03c.19-.28.41-.55.65-.78A10 10 0 0 1 12 2z"/><path d="M12 12v.01"/><path d="M16 12v.01"/><path d="M8 12v.01"/></svg>`;
+        avatarDiv.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>`;
 
         const contentDiv = document.createElement("div");
         contentDiv.classList.add("msg-content");
@@ -148,6 +204,11 @@ document.addEventListener("DOMContentLoaded", () => {
         chatLog.appendChild(messageDiv);
         chatLog.scrollTop = chatLog.scrollHeight;
         
+        // Hide welcome screen when typing
+        if (welcomeScreen) {
+            welcomeScreen.style.display = "none";
+        }
+
         return indicatorId;
     }
 

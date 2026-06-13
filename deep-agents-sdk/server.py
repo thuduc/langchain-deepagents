@@ -31,12 +31,13 @@ class ChatResponse(BaseModel):
     response: str
     session_id: str
 
-# Load SKILL.md dynamically
-def get_system_prompt() -> str:
-    skill_path = "skills/hpi_analysis/SKILL.md"
-    metadata_path = "skills/hpi_analysis/references/hpi_metadata.json"
+# Load SKILL.md dynamically based on skill_name and SKILLS_DIR environment variable
+def load_skill_prompt(skill_name: str) -> str:
+    skills_dir = os.environ.get("SKILLS_DIR", "skills")
+    skill_path = os.path.join(skills_dir, skill_name, "SKILL.md")
+    metadata_path = os.path.join(skills_dir, skill_name, "references", "hpi_metadata.json")
     
-    prompt = "You are an advanced agentic coding assistant for HPI (House Price Index) analysis.\n"
+    prompt = f"You are an advanced specialist worker executing tasks for the skill '{skill_name}'.\n"
     
     if os.path.exists(skill_path):
         with open(skill_path, "r") as f:
@@ -45,8 +46,78 @@ def get_system_prompt() -> str:
         with open(metadata_path, "r") as f:
             prompt += f"\n--- Dataset Metadata ---\n{f.read()}\n"
             
-    prompt += "\nCore Objective: Analyze the user's request, formulate python code to explore the data or plot charts, run the code using the execute_python tool, and present the final answer to the user. Always use index_nsa unless seasonally adjusted (index_sa) is specifically requested. If the user asks for charts, save them to 'deep-agents-sdk/static/charts/<filename>.png' and return a standard markdown image link: ![Chart](/static/charts/<filename>.png). If the user explicitly requests to save the chart to another custom location (like the 'examples' directory), write the python code to save it there, and also return a standard markdown image link using the mounted path so that it renders in the chat log: e.g. ![Chart](/examples/<filename>.png)."
+    # Standard fallback rules for the execution sandbox
+    prompt += "\nCore Objective: Analyze the task instructions, formulate python code to explore the data or plot charts, run the code using the execute_python tool, and present the final answer to the user. Always use index_nsa unless seasonally adjusted (index_sa) is specifically requested. If the user asks for charts, save them to 'deep-agents-sdk/static/charts/<filename>.png' and return a standard markdown image link: ![Chart](/static/charts/<filename>.png). If the user explicitly requests to save the chart to another custom location (like the 'examples' directory), write the python code to save it there, and also return a standard markdown image link using the mounted path so that it renders in the chat log: e.g. ![Chart](/examples/<filename>.png)."
     return prompt
+
+# Dynamic Supervisor prompt based on scanning available skills under SKILLS_DIR
+def get_supervisor_system_prompt() -> str:
+    skills_dir = os.environ.get("SKILLS_DIR", "skills")
+    prompt = (
+        "You are a supervisor coordinator. Your goal is to analyze the user prompt and coordinate the plan.\n"
+        "You have access to a repository of specialist skills that you can load dynamically using the 'specialist_worker' tool.\n\n"
+        "Available Skills:\n"
+    )
+    
+    if os.path.exists(skills_dir):
+        for folder_name in os.listdir(skills_dir):
+            skill_md = os.path.join(skills_dir, folder_name, "SKILL.md")
+            if os.path.exists(skill_md):
+                desc = f"Specialist skill for {folder_name}"
+                try:
+                    with open(skill_md, "r") as f:
+                        lines = [f.readline() for _ in range(15)]
+                        for line in lines:
+                            if "description:" in line.lower() or "desc:" in line.lower():
+                                desc = line.split(":", 1)[1].strip()
+                                desc = desc.strip("\"'")
+                                break
+                            elif line.startswith("#"):
+                                desc = line.replace("#", "").strip()
+                except Exception:
+                    pass
+                prompt += f"- '{folder_name}': {desc}\n"
+    else:
+        prompt += "- 'hpi_analysis': Calculations, growth rate calculations, or generate charts on FHFA House Price Index data.\n"
+        prompt += "- 'report_writer': Write structured summaries, markdown reports, or copywriting.\n"
+        
+    prompt += (
+        "\nCore Objective: Analyze the user's request. Create a plan and delegate sub-tasks to the 'specialist_worker' by specifying "
+        "the correct 'skill_name' (e.g. 'hpi_analysis' or 'report_writer') and 'task_description'. "
+        "Collect the execution results from the specialist, synthesize the findings, and present the final answer to the user."
+    )
+    return prompt
+
+# Helper to fetch ChatOpenAI instance routed via Portkey Gateway
+def get_llm_instance():
+    from langchain_openai import ChatOpenAI
+    from portkey_ai import createHeaders, PORTKEY_GATEWAY_URL
+    
+    portkey_api_key = os.environ.get("PORTKEY_API_KEY")
+    provider_slug = os.environ.get("PORTKEY_PROVIDER_SLUG", "google-ai-studio")
+    model_name = os.environ.get("MODEL", "gemini-2.5-flash")
+    
+    temp_env = os.environ.get("TEMPERATURE")
+    if temp_env is not None:
+        try:
+            temperature = float(temp_env)
+        except ValueError:
+            temperature = 0.0
+    else:
+        temperature = 1.0 if "gpt-5" in model_name else 0.0
+
+    headers = createHeaders(
+        api_key=portkey_api_key,
+        provider=provider_slug
+    )
+
+    return ChatOpenAI(
+        model=f"@{provider_slug}/{model_name}" if not model_name.startswith("@") else model_name,
+        temperature=temperature,
+        base_url=PORTKEY_GATEWAY_URL,
+        default_headers=headers,
+        api_key=portkey_api_key,
+    )
 
 # Tools implementation
 def tool_read_file(path: str) -> str:
@@ -122,40 +193,13 @@ def get_agent_graph():
 
     from langchain_openai import ChatOpenAI
     from langchain_core.tools import tool
-    from portkey_ai import createHeaders, PORTKEY_GATEWAY_URL
     from deepagents import create_deep_agent
     from langgraph.checkpoint.sqlite import SqliteSaver
 
-    portkey_api_key = os.environ.get("PORTKEY_API_KEY")
-    provider_slug = os.environ.get("PORTKEY_PROVIDER_SLUG", "google-ai-studio")
-    model_name = os.environ.get("MODEL", "gemini-2.5-flash")
-    
-    # Choose temperature based on the selected model
-    temp_env = os.environ.get("TEMPERATURE")
-    if temp_env is not None:
-        try:
-            temperature = float(temp_env)
-        except ValueError:
-            temperature = 0.0
-    else:
-        temperature = 1.0 if "gpt-5" in model_name else 0.0
+    # Fetch configured LLM instance
+    llm = get_llm_instance()
 
-    # Configure headers using Portkey SDK
-    headers = createHeaders(
-        api_key=portkey_api_key,
-        provider=provider_slug
-    )
-
-    # Initialize standard ChatOpenAI wrapper routing via Portkey Gateway URL
-    llm = ChatOpenAI(
-        model=f"@{provider_slug}/{model_name}" if not model_name.startswith("@") else model_name,
-        temperature=temperature,
-        base_url=PORTKEY_GATEWAY_URL,
-        default_headers=headers,
-        api_key=portkey_api_key,  # Needs a dummy/valid key to pass initialization checks
-    )
-
-    # Register custom tools for HPI analysis
+    # Register custom tools for the specialist worker
     @tool
     def read_file(path: str) -> str:
         """Read a file in the project folder."""
@@ -171,20 +215,45 @@ def get_agent_graph():
         """Execute python code inside the virtual environment."""
         return tool_execute_python(code)
 
-    # Sub-agent blueprints
-    hpi_analyst_blueprint = {
-        "name": "hpi_analyst",
-        "description": "Perform data analysis, HPI growth rate calculations, or generate charts on FHFA House Price Index (HPI) data. Can execute Python code.",
-        "system_prompt": get_system_prompt(),
-        "tools": [read_file, write_file, execute_python]
-    }
-
-    report_writer_blueprint = {
-        "name": "report_writer",
-        "description": "Write comprehensive summaries, articles, or blog posts. Synthesizes data files saved in the workspace.",
-        "system_prompt": "You are a professional copywriter. Your goal is to read raw data, calculations, or files from the filesystem and format them into structured, beautiful reports or summaries.",
-        "tools": [read_file, write_file]
-    }
+    # Universal specialist worker tool
+    @tool
+    def specialist_worker(skill_name: str, task_description: str) -> str:
+        """
+        Invoke the universal specialist worker to execute a task using a specific skill.
+        
+        Args:
+            skill_name: The name of the skill folder to load (e.g. 'hpi_analysis').
+            task_description: The detailed task instructions to execute.
+        """
+        # Load the LLM instance dynamically
+        worker_llm = get_llm_instance()
+        
+        # Load dynamic guidelines prompt for the requested skill
+        system_prompt = load_skill_prompt(skill_name)
+        
+        # Map of tools that the specialist can execute
+        specialist_tools = [read_file, write_file, execute_python]
+        
+        try:
+            # Create a transient agent under the hood using deepagents SDK
+            transient_agent = create_deep_agent(
+                model=worker_llm,
+                tools=specialist_tools,
+                system_prompt=system_prompt
+            )
+            
+            # Execute the transient agent
+            result = transient_agent.invoke(
+                {"messages": [{"role": "user", "content": task_description}]}
+            )
+            
+            # Extract output
+            messages = result.get("messages", [])
+            if messages:
+                return message_content_to_text(messages[-1].content)
+            return "Specialist completed the task but returned no content."
+        except Exception as e:
+            return f"Error executing task using skill '{skill_name}': {str(e)}"
 
     # Initialize SQLite database with WAL and busy timeout for persistence
     db_path = "deep-agents-sdk/checkpoints.db"
@@ -194,12 +263,12 @@ def get_agent_graph():
     conn.execute("PRAGMA busy_timeout = 5000;")
     checkpointer = SqliteSaver(conn)
 
-    # Create the central coordinator (supervisor) agent using Deep Agents SDK
+    # Compile the central coordinator (supervisor) agent using Deep Agents SDK
     _agent_graph = create_deep_agent(
         model=llm,
-        tools=[],  # The supervisor delegates all tools to specialists
-        subagents=[hpi_analyst_blueprint, report_writer_blueprint],
-        system_prompt="You are a supervisor coordinator. Analyze the user prompt. Create a plan and delegate sub-tasks to the 'hpi_analyst' for data retrieval/calculations/charts, and to the 'report_writer' to write reports or formatted summaries. Present the final output back to the user.",
+        tools=[specialist_worker],  # The supervisor delegates using this tool
+        subagents=[],  # Specialists are injected on-demand
+        system_prompt=get_supervisor_system_prompt(),
         checkpointer=checkpointer
     )
     return _agent_graph

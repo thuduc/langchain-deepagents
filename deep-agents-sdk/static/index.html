@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HPI Agent Workspace - FHFA House Price Index Explorer</title>
-    <meta name="description" content="Explore and analyze US Federal Housing Finance Agency (FHFA) House Price Index (HPI) data with an autonomous agentic assistant.">
+    <title>HPI Explorer - Gemini Agent Sandbox</title>
+    <meta name="description" content="Explore and analyze US Federal Housing Finance Agency (FHFA) House Price Index (HPI) data with a Gemini-style clean UI.">
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,91 +22,99 @@
         <!-- Sidebar containing metadata & suggestions -->
         <aside class="sidebar" id="app-sidebar">
             <div class="sidebar-header">
+                <button class="menu-toggle-btn" id="menu-btn" aria-label="Toggle sidebar width">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="18" x2="20" y2="18"/></svg>
+                </button>
                 <div class="app-logo">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
                     <h1>HPI Explorer</h1>
                 </div>
-                <span class="badge">Deep Agents SDK</span>
             </div>
             
-            <div class="sidebar-section">
-                <h2>HPI Datasets loaded</h2>
-                <div class="data-badge-list">
-                    <div class="data-badge">
-                        <span class="status-dot"></span>
-                        hpi_master.csv (~184k rows)
-                    </div>
-                    <div class="data-badge">
-                        <span class="status-dot"></span>
-                        hpi_dictionary.xlsx (schema)
-                    </div>
-                </div>
-            </div>
+            <button class="new-chat-btn" id="clear-chat-btn" title="Start a new chat session">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                <span>New chat</span>
+            </button>
+            
 
-            <div class="sidebar-section">
-                <h2>Sample Prompts</h2>
-                <ul class="sample-prompts" id="sample-prompts-list">
-                    <li data-prompt="What is the general difference between state-level HPI and census division HPI?">
-                        <span>Difference in geographic levels?</span>
-                    </li>
-                    <li data-prompt="Calculate California's quarterly HPI growth rate from Q1 2010 to Q1 2020.">
-                        <span>CA Growth (2010 - 2020)</span>
-                    </li>
-                    <li data-prompt="Generate a comparison line chart for California, New York, and Texas HPI from 2015 to present.">
-                        <span>Plot CA vs NY vs TX (2015+)</span>
-                    </li>
-                </ul>
-            </div>
-
+            
             <div class="sidebar-footer">
                 <div class="session-info">
                     <span>Session:</span>
                     <strong id="session-id-display">default-session</strong>
                 </div>
-                <button class="btn btn-secondary" id="clear-chat-btn">Clear Chat</button>
             </div>
         </aside>
 
         <!-- Main Chat Area -->
         <main class="chat-workspace">
             <header class="workspace-header">
-                <div class="title-area">
-                    <h2>Agent Workspace</h2>
-                    <p>Ask the agent to analyze, compare, or plot FHFA home price indices.</p>
+                <div class="header-left">
+                    <button class="menu-toggle-btn header-menu-btn" id="header-menu-btn" aria-label="Toggle sidebar">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="18" x2="20" y2="18"/></svg>
+                    </button>
+                    <div class="model-dropdown">
+                        <span class="model-name">HPI Analyst v2.0</span>
+                    </div>
                 </div>
-                <div class="system-status">
-                    <span class="status-pill green">
-                        <span class="dot"></span> Active Sandbox (venv)
-                    </span>
+                <div class="header-actions">
+                    <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle dark/light theme">
+                        <!-- Sun Icon (shows in Dark Mode to toggle to Light) -->
+                        <svg class="sun-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+                        <!-- Moon Icon (shows in Light Mode to toggle to Dark) -->
+                        <svg class="moon-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    </button>
+
                 </div>
             </header>
 
             <section class="messages-container" id="chat-log">
-                <!-- Welcome Message -->
-                <div class="message system-message">
-                    <div class="avatar">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 0 1 7.54 16.59c.24.23.46.5.65.78l1.41 2.03a1 1 0 0 1-.82 1.6H3.22a1 1 0 0 1-.82-1.6l1.41-2.03c.19-.28.41-.55.65-.78A10 10 0 0 1 12 2z"/><path d="M12 12v.01"/><path d="M16 12v.01"/><path d="M8 12v.01"/></svg>
+                <!-- Welcome Screen (Gemini Style) -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-header">
+                        <h2 class="greet-title">Hello, HPI Explorer</h2>
+                        <h3 class="greet-subtitle">How can I help you today?</h3>
                     </div>
-                    <div class="msg-content">
-                        <h3>Welcome to the HPI Agent Workspace</h3>
-                        <p>I have direct access to the FHFA housing dataset and the columns metadata. I can dynamically write python scripts, run them within our local virtual environment, calculate growth metrics, and generate HPI comparison plots.</p>
-                        <p>Try clicking one of the sample prompts in the sidebar or type a custom question below to get started!</p>
+                    
+                    <div class="suggest-grid" id="sample-prompts-list">
+                        <div class="suggest-card" data-prompt="What is the general difference between state-level HPI and census division HPI?">
+                            <p>Explain state-level vs census division HPI differences</p>
+                            <div class="card-icon">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h10M6 10h10"/></svg>
+                            </div>
+                        </div>
+                        <div class="suggest-card" data-prompt="Calculate California's quarterly HPI growth rate from Q1 2010 to Q1 2020.">
+                            <p>Calculate California's HPI growth rate (Q1 2010 - Q1 2020)</p>
+                            <div class="card-icon">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
+                            </div>
+                        </div>
+                        <div class="suggest-card" data-prompt="Generate a comparison line chart for California, New York, and Texas HPI from 2015 to present.">
+                            <p>Compare HPI CA vs NY vs TX charts from 2015 to present</p>
+                            <div class="card-icon">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </section>
 
             <!-- Input Form Area -->
             <footer class="input-panel">
-                <div class="input-container">
-                    <textarea 
-                         id="prompt-input" 
-                         placeholder="Ask the agent to calculate HPI, compare states, or plot indices..." 
-                         rows="1"
-                         autocomplete="off"
-                    ></textarea>
-                    <button class="send-button" id="send-btn" aria-label="Send message">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                    </button>
+                <div class="input-container-wrapper">
+                    <div class="input-container">
+                        <textarea 
+                             id="prompt-input" 
+                             placeholder="Enter a prompt here..." 
+                             rows="1"
+                             autocomplete="off"
+                        ></textarea>
+                        <button class="send-button" id="send-btn" aria-label="Send message">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        </button>
+                    </div>
+                    <div class="disclaimer">
+                        HPI Explorer can make mistakes. Verify critical analytical calculations and reports.
+                    </div>
                 </div>
             </footer>
         </main>
