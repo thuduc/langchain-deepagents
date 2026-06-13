@@ -155,7 +155,7 @@ def get_agent_graph():
         api_key=portkey_api_key,  # Needs a dummy/valid key to pass initialization checks
     )
 
-    # Register custom tools for the HPI skill
+    # Register custom tools for HPI analysis
     @tool
     def read_file(path: str) -> str:
         """Read a file in the project folder."""
@@ -171,7 +171,20 @@ def get_agent_graph():
         """Execute python code inside the virtual environment."""
         return tool_execute_python(code)
 
-    tools = [read_file, write_file, execute_python]
+    # Sub-agent blueprints
+    hpi_analyst_blueprint = {
+        "name": "hpi_analyst",
+        "description": "Perform data analysis, HPI growth rate calculations, or generate charts on FHFA House Price Index (HPI) data. Can execute Python code.",
+        "system_prompt": get_system_prompt(),
+        "tools": [read_file, write_file, execute_python]
+    }
+
+    report_writer_blueprint = {
+        "name": "report_writer",
+        "description": "Write comprehensive summaries, articles, or blog posts. Synthesizes data files saved in the workspace.",
+        "system_prompt": "You are a professional copywriter. Your goal is to read raw data, calculations, or files from the filesystem and format them into structured, beautiful reports or summaries.",
+        "tools": [read_file, write_file]
+    }
 
     # Initialize SQLite database with WAL and busy timeout for persistence
     db_path = "deep-agents-sdk/checkpoints.db"
@@ -181,11 +194,12 @@ def get_agent_graph():
     conn.execute("PRAGMA busy_timeout = 5000;")
     checkpointer = SqliteSaver(conn)
 
-    # Create agent using Deep Agents SDK
+    # Create the central coordinator (supervisor) agent using Deep Agents SDK
     _agent_graph = create_deep_agent(
         model=llm,
-        tools=tools,
-        system_prompt=get_system_prompt(),
+        tools=[],  # The supervisor delegates all tools to specialists
+        subagents=[hpi_analyst_blueprint, report_writer_blueprint],
+        system_prompt="You are a supervisor coordinator. Analyze the user prompt. Create a plan and delegate sub-tasks to the 'hpi_analyst' for data retrieval/calculations/charts, and to the 'report_writer' to write reports or formatted summaries. Present the final output back to the user.",
         checkpointer=checkpointer
     )
     return _agent_graph

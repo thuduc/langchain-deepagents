@@ -159,172 +159,88 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // Safe Markdown Parser with Direct KaTeX Rendering
-    function parseMarkdown(text) {
-        const mathBlocks = [];
-        let tempText = text;
-
-        // 1. Extract Display Math: \[ ... \]
-        tempText = tempText.replace(/\\\[([\s\S]*?)\\\]/g, (match, math) => {
-            const id = `__MATH_DISP_${mathBlocks.length}__`;
-            let rendered = match;
-            try {
-                if (window.katex) {
-                    rendered = window.katex.renderToString(math.trim(), { displayMode: true, throwOnError: false });
+    // Register custom extensions for marked.js to parse and render math equations inline and block-level using KaTeX
+    if (window.marked) {
+        const blockMath = {
+            name: 'blockMath',
+            level: 'block',
+            tokenizer(src, tokens) {
+                const matchDoubleDollar = src.match(/^\$\$([\s\S]+?)\$\$/);
+                if (matchDoubleDollar) {
+                    return {
+                        type: 'blockMath',
+                        raw: matchDoubleDollar[0],
+                        math: matchDoubleDollar[1]
+                    };
                 }
-            } catch (e) {
-                console.error(e);
-            }
-            mathBlocks.push({ id, html: rendered });
-            return id;
-        });
-
-        // 2. Extract Display Math: $$ ... $$
-        tempText = tempText.replace(/\$\$([\s\S]*?)\$\$/g, (match, math) => {
-            const id = `__MATH_DISP_${mathBlocks.length}__`;
-            let rendered = match;
-            try {
-                if (window.katex) {
-                    rendered = window.katex.renderToString(math.trim(), { displayMode: true, throwOnError: false });
+                const matchBracket = src.match(/^\\\[([\s\S]+?)\\\]/);
+                if (matchBracket) {
+                    return {
+                        type: 'blockMath',
+                        raw: matchBracket[0],
+                        math: matchBracket[1]
+                    };
                 }
-            } catch (e) {
-                console.error(e);
-            }
-            mathBlocks.push({ id, html: rendered });
-            return id;
-        });
-
-        // 3. Extract Inline Math: \( ... \)
-        tempText = tempText.replace(/\\\(([\s\S]*?)\\\)/g, (match, math) => {
-            const id = `__MATH_INL_${mathBlocks.length}__`;
-            let rendered = match;
-            try {
-                if (window.katex) {
-                    rendered = window.katex.renderToString(math.trim(), { displayMode: false, throwOnError: false });
+            },
+            renderer(token) {
+                try {
+                    if (window.katex) {
+                        return `<div class="math-block">${window.katex.renderToString(token.math.trim(), { displayMode: true, throwOnError: false })}</div>`;
+                    }
+                } catch (e) {
+                    console.error("KaTeX block rendering error:", e);
                 }
-            } catch (e) {
-                console.error(e);
+                return `<div class="math-block-error">${token.raw}</div>`;
             }
-            mathBlocks.push({ id, html: rendered });
-            return id;
-        });
+        };
 
-        // 4. Extract Inline Math: $ ... $
-        tempText = tempText.replace(/\$([^\$\n]+?)\$/g, (match, math) => {
-            const id = `__MATH_INL_${mathBlocks.length}__`;
-            let rendered = match;
-            try {
-                if (window.katex) {
-                    rendered = window.katex.renderToString(math.trim(), { displayMode: false, throwOnError: false });
+        const inlineMath = {
+            name: 'inlineMath',
+            level: 'inline',
+            tokenizer(src, tokens) {
+                const matchSingleDollar = src.match(/^\$([^\$\s\n](?:[^\$\n]*?[^\$\s\n])?)\$/);
+                if (matchSingleDollar) {
+                    return {
+                        type: 'inlineMath',
+                        raw: matchSingleDollar[0],
+                        math: matchSingleDollar[1]
+                    };
                 }
-            } catch (e) {
-                console.error(e);
+                const matchParen = src.match(/^\\\(([\s\S]+?)\\\)/);
+                if (matchParen) {
+                    return {
+                        type: 'inlineMath',
+                        raw: matchParen[0],
+                        math: matchParen[1]
+                    };
+                }
+            },
+            renderer(token) {
+                try {
+                    if (window.katex) {
+                        return window.katex.renderToString(token.math.trim(), { displayMode: false, throwOnError: false });
+                    }
+                } catch (e) {
+                    console.error("KaTeX inline rendering error:", e);
+                }
+                return token.raw;
             }
-            mathBlocks.push({ id, html: rendered });
-            return id;
-        });
+        };
 
-        // Now run standard markdown parsing on tempText
-        let html = tempText
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
-
-        // Parse Markdown images: ![alt](/static/charts/xxx.png) -> img tag
-        html = html.replace(/!\[(.*?)\]\((.*?)\)/g, (match, alt, url) => {
-            return `<img src="${url}" alt="${alt}">`;
-        });
-
-        // Parse Fenced Code Blocks (```python ... ```)
-        html = html.replace(/```(.*?)\n([\s\S]*?)```/g, (match, lang, code) => {
-            return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
-        });
-
-        // Parse Inline Code (`code`)
-        html = html.replace(/`(.*?)`/g, "<code>$1</code>");
-
-        // Parse Bold (**text**)
-        html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-
-        // Parse Markdown Tables
-        html = parseTables(html);
-
-        // Convert remaining double newlines to paragraphs
-        // Except inside pre blocks, tables, or display math placeholders
-        const paragraphs = html.split(/\n\n+/);
-        let finalHtml = "";
-        paragraphs.forEach(p => {
-            const trimmed = p.trim();
-            if (trimmed.startsWith("<pre>") || trimmed.startsWith("<table>")) {
-                finalHtml += p;
-            } else if (trimmed.startsWith("__MATH_DISP_")) {
-                finalHtml += trimmed;
-            } else {
-                // replace single newlines with <br> inside regular text paragraphs
-                finalHtml += `<p>${p.replace(/\n/g, "<br>")}</p>`;
-            }
-        });
-
-        // Replace math placeholders back with raw KaTeX HTML output
-        mathBlocks.forEach(item => {
-            finalHtml = finalHtml.replace(item.id, item.html);
-        });
-
-        return finalHtml;
+        window.marked.use({ extensions: [blockMath, inlineMath] });
     }
 
-    // Markdown Table Parser
-    function parseTables(text) {
-        const lines = text.split("\n");
-        let inTable = false;
-        let tableHtml = "";
-        let finalLines = [];
-        let headers = [];
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-            
-            // Detect table rows by checking if line starts and ends with '|'
-            if (line.startsWith("|") && line.endsWith("|")) {
-                const cells = line.split("|").slice(1, -1).map(c => c.trim());
-                
-                if (!inTable) {
-                    inTable = true;
-                    // First row is header row
-                    headers = cells;
-                    tableHtml = "<table><thead><tr>";
-                    headers.forEach(h => {
-                        tableHtml += `<th>${h}</th>`;
-                    });
-                    tableHtml += "</tr></thead><tbody>";
-                } else {
-                    // Check if it's the divider row (e.g. |---|---|)
-                    if (cells.every(c => c.match(/^:?-+:?$/))) {
-                        continue; // skip divider line
-                    }
-                    
-                    tableHtml += "<tr>";
-                    cells.forEach(c => {
-                        tableHtml += `<td>${c}</td>`;
-                    });
-                    tableHtml += "</tr>";
-                }
-            } else {
-                if (inTable) {
-                    inTable = false;
-                    tableHtml += "</tbody></table>";
-                    finalLines.push(tableHtml);
-                    tableHtml = "";
-                }
-                finalLines.push(lines[i]);
-            }
+    // Robust Markdown Parser using Marked library with Direct KaTeX Rendering
+    function parseMarkdown(text) {
+        if (window.marked && window.marked.parse) {
+            return window.marked.parse(text);
+        } else {
+            // Fallback to basic text formatting if marked fails to load
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\n/g, "<br>");
         }
-        
-        if (inTable) {
-            tableHtml += "</tbody></table>";
-            finalLines.push(tableHtml);
-        }
-
-        return finalLines.join("\n");
     }
 });
