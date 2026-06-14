@@ -1,6 +1,8 @@
 .DS_Store
 .claude/
+.env
 .env.*
+!.env.template
 deep-agents-sdk/__pycache__/
 deep-agents-sdk/static/charts/
 deep-agents-sdk/tmp_uploads/

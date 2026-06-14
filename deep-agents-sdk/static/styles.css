@@ -48,7 +48,8 @@ body {
 
 button,
 textarea,
-select {
+select,
+input {
     font: inherit;
 }
 
@@ -124,6 +125,7 @@ button:disabled {
 .icon-button svg,
 .project-select svg,
 .project-menu svg,
+.settings-button svg,
 .mobile-menu svg,
 .theme-toggle svg {
     width: 16px;
@@ -319,11 +321,36 @@ button:disabled {
 }
 
 .sidebar-footer {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 8px;
+    margin-top: auto;
     padding-top: 10px;
     border-top: 1px solid var(--border);
+}
+
+.settings-button {
+    width: 100%;
+    min-height: 32px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 0 7px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--soft);
+    background: transparent;
+    font-size: 12.5px;
+    font-weight: 500;
+    text-align: left;
+}
+
+.settings-button svg {
+    width: 14px;
+    height: 14px;
+}
+
+.settings-button:hover {
+    color: var(--text);
+    background: var(--panel-2);
+    border-color: var(--border);
 }
 
 .workspace {
@@ -395,7 +422,8 @@ button:disabled {
 .sidebar.collapsed .section-actions,
 .sidebar.collapsed .sessions-section,
 .sidebar.collapsed .project-select .item-label,
-.sidebar.collapsed .row-action {
+.sidebar.collapsed .row-action,
+.sidebar.collapsed .settings-button span {
     display: none;
 }
 
@@ -415,6 +443,17 @@ button:disabled {
     align-items: center;
 }
 
+.sidebar.collapsed .sidebar-footer {
+    border-top: 0;
+    padding-top: 0;
+}
+
+.sidebar.collapsed .settings-button {
+    width: 40px;
+    justify-content: center;
+    padding: 0;
+}
+
 .workspace-header {
     height: 64px;
     padding: 0 22px;
@@ -425,8 +464,9 @@ button:disabled {
     min-width: 0;
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: flex-start;
     gap: 3px;
+    text-align: left;
 }
 
 .workspace-title strong,
@@ -740,6 +780,50 @@ button:disabled {
     padding: 0 10px;
 }
 
+.settings-modal {
+    width: min(460px, 100%);
+}
+
+.settings-form {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 18px;
+}
+
+.settings-field {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.settings-field select,
+.settings-field input {
+    width: 100%;
+    min-height: 38px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0 10px;
+    color: var(--text);
+    background: var(--bg);
+    outline: 0;
+}
+
+.settings-field select:focus,
+.settings-field input:focus {
+    border-color: rgba(249, 115, 22, 0.7);
+}
+
+.settings-status {
+    min-height: 18px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+
 .file-tree {
     overflow: auto;
     padding: 10px 18px 18px;
@@ -818,7 +902,8 @@ button:disabled {
     .sidebar.collapsed .section-actions,
     .sidebar.collapsed .sessions-section,
     .sidebar.collapsed .project-select .item-label,
-    .sidebar.collapsed .row-action {
+    .sidebar.collapsed .row-action,
+    .sidebar.collapsed .settings-button span {
         display: flex;
     }
 
@@ -841,6 +926,17 @@ button:disabled {
 
     .sidebar.collapsed .nav-section {
         align-items: stretch;
+    }
+
+    .sidebar.collapsed .sidebar-footer {
+        border-top: 1px solid var(--border);
+        padding-top: 10px;
+    }
+
+    .sidebar.collapsed .settings-button {
+        width: 100%;
+        justify-content: flex-start;
+        padding: 0 8px;
     }
 
     .sidebar.open {

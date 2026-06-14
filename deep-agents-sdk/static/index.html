@@ -29,9 +29,6 @@
                 <div class="section-header">
                     <span>Projects</span>
                     <div class="section-actions">
-                        <button class="icon-button" id="import-project-btn" title="Import project from ZIP" aria-label="Import project from ZIP">
-                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 8 5-5 5 5"></path><path d="M5 15v4h14v-4"></path></svg>
-                        </button>
                         <button class="icon-button" id="add-project-btn" title="Add project" aria-label="Add project">
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
                         </button>
@@ -46,6 +43,13 @@
                 </div>
                 <div class="list" id="session-list"></div>
             </section>
+
+            <footer class="sidebar-footer">
+                <button class="settings-button" id="settings-btn" type="button" title="Settings" aria-label="Settings">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2.05 2.05 0 0 1-2.9 2.9l-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1 1.55V21a2.05 2.05 0 0 1-4.1 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.88.34l-.06.06a2.05 2.05 0 0 1-2.9-2.9l.06-.06a1.7 1.7 0 0 0 .34-1.88 1.7 1.7 0 0 0-1.55-1H3a2.05 2.05 0 0 1 0-4.1h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06a2.05 2.05 0 0 1 2.9-2.9l.06.06a1.7 1.7 0 0 0 1.88.34h.01a1.7 1.7 0 0 0 1-1.55V3a2.05 2.05 0 0 1 4.1 0v.09a1.7 1.7 0 0 0 1 1.55h.01a1.7 1.7 0 0 0 1.88-.34l.06-.06a2.05 2.05 0 0 1 2.9 2.9l-.06.06a1.7 1.7 0 0 0-.34 1.88v.01a1.7 1.7 0 0 0 1.55 1H21a2.05 2.05 0 0 1 0 4.1h-.09a1.7 1.7 0 0 0-1.55 1Z"></path></svg>
+                    <span>Settings</span>
+                </button>
+            </footer>
         </aside>
 
         <main class="workspace">
@@ -118,6 +122,34 @@
             <div class="modal-actions">
                 <button class="secondary-action" data-close-modal="upload-modal">Cancel</button>
                 <button class="primary-action" id="confirm-import-btn">Import</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-backdrop hidden" id="settings-modal">
+        <div class="modal settings-modal">
+            <div class="modal-header">
+                <div>
+                    <h2>Settings</h2>
+                </div>
+                <button class="icon-button" data-close-modal="settings-modal" aria-label="Close">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+                </button>
+            </div>
+            <div class="settings-form">
+                <label class="settings-field">
+                    <span>Default Model</span>
+                    <select id="settings-default-model"></select>
+                </label>
+                <label class="settings-field">
+                    <span>Max Sessions Per Project</span>
+                    <input id="settings-max-sessions" type="number" min="1" max="100" step="1">
+                </label>
+                <p class="settings-status" id="settings-status" role="status"></p>
+            </div>
+            <div class="modal-actions">
+                <button class="secondary-action" data-close-modal="settings-modal">Cancel</button>
+                <button class="primary-action" id="save-settings-btn">Save</button>
             </div>
         </div>
     </div>

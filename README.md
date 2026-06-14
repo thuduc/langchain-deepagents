@@ -11,7 +11,7 @@ The application features a FastAPI REST server that drives a supervisor coordina
 ```text
 langchain-deepagents/
 ├── README.md
-├── .env-template
+├── .env.template
 ├── projects/
 │   └── hpi-analytics/
 │       ├── data/
@@ -34,7 +34,7 @@ langchain-deepagents/
 ## 2. Prerequisites
 
 1. **Portkey API Gateway**: Setup a Portkey account to access the Gateway.
-2. **Google AI Studio Integration**: Integrate Google AI Studio (Gemini 2.5 Flash) with Portkey and obtain the provider slug.
+2. **Portkey LLM Integration**: Configure a Portkey provider slug that supports the models listed in `AVAILABLE_MODELS`.
 3. **Projects**: The default `HPI Analytics` project is stored under `projects/hpi-analytics/`.
 
 ---
@@ -60,14 +60,21 @@ All setup and execution tasks must use the SDK-local virtual environment (`deep-
 ## 4. Running the Web Application
 
 1. **Configure Environment Variables**:
-   Create a `.env.portkey` file (or `.env` file) in the **project root folder** with the following keys:
+   Copy `.env.template` to `.env` in the **project root folder**, then customize the values for your environment:
+   ```bash
+   cp .env.template .env
+   ```
+   The `.env` file uses these keys:
    ```text
    PORTKEY_API_KEY=your_portkey_api_key_here
-   PORTKEY_PROVIDER_SLUG=your_google_provider_slug_in_portkey
-   MODEL=gemini-2.5-flash
-   TEMPERATURE=0.0
+   PORTKEY_PROVIDER_SLUG=your_provider_slug_in_portkey
+   AVAILABLE_MODELS=gpt-5.5,gpt-5.4,gpt-5.4-codex
+   DEFAULT_MODEL=gpt-5.5
+   MAX_SESSIONS_PER_PROJECT=5
+   TEMPERATURE=1.0
    PROJECTS_DIR=projects
    ```
+   Runtime Settings changes are stored in `deep-agents-sdk/checkpoints.db`; `.env` provides the model allowlist and initial defaults.
 
 2. **Start the FastAPI Server**:
    Launch the uvicorn development server on port 9010:
@@ -86,6 +93,8 @@ All setup and execution tasks must use the SDK-local virtual environment (`deep-
 ## 5. REST API Endpoints
 
 - **`GET /`**: Serves the Chat UI frontend (`index.html`).
+- **`GET /api/settings`**: Returns available models, the selected default model, and the project session limit.
+- **`PUT /api/settings`**: Updates the default model and max sessions per project.
 - **`GET /api/projects`**: Lists available projects.
 - **`POST /api/projects`**: Creates an empty project.
 - **`DELETE /api/projects/{project_id}`**: Deletes the project record and its folder from disk.

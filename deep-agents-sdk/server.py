@@ -26,10 +26,6 @@ TMP_EXEC_DIR = SDK_DIR / "tmp_execution"
 DB_PATH = SDK_DIR / "checkpoints.db"
 
 load_dotenv(BASE_DIR / ".env")
-if not os.environ.get("PORTKEY_API_KEY") and (BASE_DIR / ".env.portkey").exists():
-    load_dotenv(BASE_DIR / ".env.portkey")
-elif (BASE_DIR / ".env.portkey").exists():
-    load_dotenv(BASE_DIR / ".env.portkey")
 
 CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 TMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,6 +51,10 @@ MEDIA_LABEL_RE = re.compile(
     r"(?:at|to|as|path)?\s*:?\s*$",
     re.IGNORECASE,
 )
+DEFAULT_AVAILABLE_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-codex"]
+DEFAULT_MAX_SESSIONS_PER_PROJECT = 5
+SETTING_DEFAULT_MODEL = "default_model"
+SETTING_MAX_SESSIONS_PER_PROJECT = "max_sessions_per_project"
 
 
 class ProjectCreateRequest(BaseModel):
@@ -74,6 +74,11 @@ class ContentImportRequest(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    default_model: str = Field(..., min_length=1)
+    max_sessions_per_project: int = Field(..., ge=1, le=100)
 
 
 class ChatRequest(BaseModel):
@@ -149,9 +154,16 @@ def init_db() -> None:
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         seed_default_project(conn)
+    prune_all_project_sessions()
 
 
 def seed_default_project(conn: sqlite3.Connection) -> None:
@@ -175,6 +187,118 @@ def seed_default_project(conn: sqlite3.Connection) -> None:
         """,
         (default_slug, "HPI Analytics", default_slug, str(default_path), now, now),
     )
+
+
+def parse_available_models() -> List[str]:
+    raw = os.environ.get("AVAILABLE_MODELS", "")
+    models = [model.strip() for model in raw.split(",") if model.strip()]
+    return models or DEFAULT_AVAILABLE_MODELS.copy()
+
+
+def env_default_model(available_models: List[str]) -> str:
+    configured = os.environ.get("DEFAULT_MODEL", "").strip()
+    if configured and configured in available_models:
+        return configured
+    return available_models[0] if available_models else DEFAULT_AVAILABLE_MODELS[0]
+
+
+def env_max_sessions_per_project() -> int:
+    raw = os.environ.get("MAX_SESSIONS_PER_PROJECT", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_SESSIONS_PER_PROJECT
+    return min(max(value, 1), 100)
+
+
+def coerce_max_sessions(value: Any, fallback: int) -> int:
+    try:
+        return min(max(int(value), 1), 100)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def get_app_settings() -> Dict[str, Any]:
+    available_models = parse_available_models()
+    default_model = env_default_model(available_models)
+    max_sessions = env_max_sessions_per_project()
+
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    saved = {row["key"]: row["value"] for row in rows}
+    saved_default = saved.get(SETTING_DEFAULT_MODEL, "").strip()
+    if saved_default in available_models:
+        default_model = saved_default
+
+    max_sessions = coerce_max_sessions(
+        saved.get(SETTING_MAX_SESSIONS_PER_PROJECT), max_sessions
+    )
+
+    return {
+        "available_models": available_models,
+        "default_model": default_model,
+        "max_sessions_per_project": max_sessions,
+    }
+
+
+def save_app_settings(default_model: str, max_sessions_per_project: int) -> Dict[str, Any]:
+    available_models = parse_available_models()
+    if default_model not in available_models:
+        raise HTTPException(status_code=400, detail="Default model must be one of the available models")
+
+    max_sessions = coerce_max_sessions(max_sessions_per_project, DEFAULT_MAX_SESSIONS_PER_PROJECT)
+    old_settings = get_app_settings()
+    now = utc_now()
+    with get_db_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            [
+                (SETTING_DEFAULT_MODEL, default_model, now),
+                (SETTING_MAX_SESSIONS_PER_PROJECT, str(max_sessions), now),
+            ],
+        )
+
+    if default_model != old_settings["default_model"]:
+        _agent_graphs.clear()
+
+    prune_all_project_sessions(max_sessions)
+    return get_app_settings()
+
+
+def prune_project_sessions(project_id: str, max_sessions: Optional[int] = None) -> None:
+    limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
+    limit = coerce_max_sessions(limit, DEFAULT_MAX_SESSIONS_PER_PROJECT)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id FROM chat_sessions
+            WHERE project_id = ?
+            ORDER BY updated_at DESC, created_at DESC, id DESC
+            """,
+            (project_id,),
+        ).fetchall()
+        stale_ids = [row["id"] for row in rows[limit:]]
+        if stale_ids:
+            conn.executemany(
+                "DELETE FROM chat_sessions WHERE id = ? AND project_id = ?",
+                [(session_id, project_id) for session_id in stale_ids],
+            )
+
+
+def prune_all_project_sessions(max_sessions: Optional[int] = None) -> None:
+    limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT id FROM projects").fetchall()
+    for row in rows:
+        prune_project_sessions(row["id"], limit)
 
 
 def row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
@@ -550,6 +674,7 @@ def create_session(project_id: str, title: Optional[str] = None) -> Dict[str, An
                 now,
             ),
         )
+    prune_project_sessions(project_id)
     return {
         "id": session_id,
         "project_id": project_id,
@@ -752,7 +877,7 @@ def get_llm_instance():
 
     portkey_api_key = os.environ.get("PORTKEY_API_KEY")
     provider_slug = os.environ.get("PORTKEY_PROVIDER_SLUG", "google-ai-studio")
-    model_name = os.environ.get("MODEL", "gemini-2.5-flash")
+    model_name = get_app_settings()["default_model"]
 
     temp_env = os.environ.get("TEMPERATURE")
     if temp_env is not None:
@@ -946,6 +1071,22 @@ def get_index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/api/settings")
+def api_get_settings():
+    init_db()
+    return {"settings": get_app_settings()}
+
+
+@app.put("/api/settings")
+def api_update_settings(request: SettingsUpdateRequest):
+    init_db()
+    settings = save_app_settings(
+        request.default_model.strip(),
+        request.max_sessions_per_project,
+    )
+    return {"settings": settings}
+
+
 @app.get("/api/projects")
 def api_list_projects():
     init_db()
@@ -1045,12 +1186,13 @@ def api_project_media(project_id: str, media_path: str):
 @app.get("/api/projects/{project_id}/sessions")
 def api_list_sessions(project_id: str):
     get_project(project_id)
+    prune_project_sessions(project_id)
     with get_db_connection() as conn:
         rows = conn.execute(
             """
             SELECT * FROM chat_sessions
             WHERE project_id = ?
-            ORDER BY updated_at DESC
+            ORDER BY updated_at DESC, created_at DESC, id DESC
             """,
             (project_id,),
         ).fetchall()

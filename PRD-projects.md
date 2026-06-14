@@ -2,7 +2,7 @@
 
 Current the deep-agents-sdk implementation supports skills under skills/ folder. These skills refer to data residing under data/ . We need to add support for multiple projects, each with its own skills, data, and resources. Here are the requirements for multi-project support:
 
-- Add a new variable to .env.portkey (and also the default template .env-template) called PROJECTS_DIR. This will point to the parent folder of all projects. The default value is projects. The SKILLS_DIR is no longer used. If skills exist for a project, they need to exists under a skills folder of that projects. Under the skills subfolder, there could be multiple subfolders, each with its own skill. Every skill needs to be named SKILL.md
+- Add a new variable to `.env` (and also the default template `.env.template`) called `PROJECTS_DIR`. This will point to the parent folder of all projects. The default value is `projects`. The `SKILLS_DIR` is no longer used. If skills exist for a project, they need to exist under a `skills` folder of that project. Under the skills subfolder, there could be multiple subfolders, each with its own skill. Every skill needs to be named `SKILL.md`.
 - Each project will have a project name, whose name will be used to create a directory for it under the projects folder as defined in PROJECTS_DIR variable
 - Each project will have multiple child folders. Currently we only use 2 child folders: data and skills. But others could be added and used per project.
 - Use a database table to maintain a list of projects

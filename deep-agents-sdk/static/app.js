@@ -9,6 +9,7 @@ document.addEventListener("DOMContentLoaded", () => {
         uploadProjectId: null,
         pendingProjectName: null,
         menuProjectId: null,
+        settings: null,
     };
 
     const els = {
@@ -17,7 +18,12 @@ document.addEventListener("DOMContentLoaded", () => {
         projectList: document.getElementById("project-list"),
         sessionList: document.getElementById("session-list"),
         addProjectBtn: document.getElementById("add-project-btn"),
-        importProjectBtn: document.getElementById("import-project-btn"),
+        settingsBtn: document.getElementById("settings-btn"),
+        settingsModal: document.getElementById("settings-modal"),
+        settingsDefaultModel: document.getElementById("settings-default-model"),
+        settingsMaxSessions: document.getElementById("settings-max-sessions"),
+        settingsStatus: document.getElementById("settings-status"),
+        saveSettingsBtn: document.getElementById("save-settings-btn"),
         projectMenu: document.getElementById("project-menu"),
         projectTitle: document.getElementById("project-title"),
         sessionTitle: document.getElementById("session-title"),
@@ -70,7 +76,8 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         els.addProjectBtn.addEventListener("click", createEmptyProject);
-        els.importProjectBtn.addEventListener("click", () => startZipFlow("new"));
+        els.settingsBtn.addEventListener("click", openSettings);
+        els.saveSettingsBtn.addEventListener("click", saveSettings);
         els.sendBtn.addEventListener("click", sendMessage);
         els.confirmImportBtn.addEventListener("click", confirmImport);
         els.projectMenu.addEventListener("click", handleProjectMenuAction);
@@ -98,6 +105,7 @@ document.addEventListener("DOMContentLoaded", () => {
         document.addEventListener("keydown", (event) => {
             if (event.key === "Escape") {
                 closeProjectMenu();
+                closeModal("settings-modal");
             }
         });
 
@@ -246,7 +254,7 @@ document.addEventListener("DOMContentLoaded", () => {
         els.sessionTitle.textContent = state.currentSession ? state.currentSession.title : hasProject ? "No chat selected" : "Select a project to begin";
         els.promptInput.disabled = !hasProject;
         els.sendBtn.disabled = !hasProject;
-        els.promptInput.placeholder = hasProject ? "Do anything" : "Select a project to start";
+        els.promptInput.placeholder = hasProject ? "Ask this project to investigate..." : "Select a project to start";
         els.composerHint.textContent = hasProject ? `Using skills and data from ${state.currentProject.name}.` : "Prompts are scoped to the selected project.";
         renderProjects();
         renderSessions();
@@ -312,6 +320,85 @@ document.addEventListener("DOMContentLoaded", () => {
         renderMessages(data.messages || []);
         updateProjectState();
         els.sidebar.classList.remove("open");
+    }
+
+    async function openSettings() {
+        closeProjectMenu();
+        try {
+            const settings = await loadSettings();
+            renderSettings(settings);
+            openModal("settings-modal");
+        } catch (error) {
+            window.alert(error.message);
+        }
+    }
+
+    async function loadSettings() {
+        const data = await api("/api/settings");
+        state.settings = data.settings;
+        return state.settings;
+    }
+
+    function renderSettings(settings) {
+        els.settingsDefaultModel.innerHTML = "";
+        (settings.available_models || []).forEach((model) => {
+            const option = document.createElement("option");
+            option.value = model;
+            option.textContent = model;
+            if (model === settings.default_model) {
+                option.selected = true;
+            }
+            els.settingsDefaultModel.appendChild(option);
+        });
+        els.settingsMaxSessions.value = settings.max_sessions_per_project || 5;
+        els.settingsStatus.textContent = "";
+    }
+
+    async function saveSettings() {
+        const defaultModel = els.settingsDefaultModel.value;
+        const maxSessions = Number.parseInt(els.settingsMaxSessions.value, 10);
+        if (!defaultModel || !Number.isInteger(maxSessions) || maxSessions < 1) {
+            els.settingsStatus.textContent = "Enter a valid session limit.";
+            return;
+        }
+
+        els.saveSettingsBtn.disabled = true;
+        els.settingsStatus.textContent = "Saving...";
+        try {
+            const data = await api("/api/settings", {
+                method: "PUT",
+                body: JSON.stringify({
+                    default_model: defaultModel,
+                    max_sessions_per_project: maxSessions,
+                }),
+            });
+            state.settings = data.settings;
+            renderSettings(state.settings);
+            closeModal("settings-modal");
+            await reconcileCurrentSessions();
+        } catch (error) {
+            els.settingsStatus.textContent = error.message;
+        } finally {
+            els.saveSettingsBtn.disabled = false;
+        }
+    }
+
+    async function reconcileCurrentSessions() {
+        if (!state.currentProject) return;
+        await loadSessions();
+        const currentStillExists = state.currentSession
+            && state.sessions.some((session) => session.id === state.currentSession.id);
+        if (currentStillExists) {
+            updateProjectState();
+            return;
+        }
+        state.currentSession = null;
+        if (state.sessions.length) {
+            await selectSession(state.sessions[0].id);
+        } else {
+            updateProjectState();
+            showEmpty("What should we work on?", "This project has no chats yet.");
+        }
     }
 
     function renderMessages(messages) {
