@@ -1,8 +1,9 @@
 .DS_Store
 .claude/
 .env.*
-deep-agents-sdk/static/charts/
 deep-agents-sdk/__pycache__/
+deep-agents-sdk/static/charts/
+deep-agents-sdk/tmp_uploads/
 examples/
 venv/
-
+projects/nmdb-analytics/data/*.csv
