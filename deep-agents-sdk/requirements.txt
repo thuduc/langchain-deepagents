@@ -10,3 +10,4 @@ portkey-ai>=0.1.0
 deepagents>=0.0.1
 langgraph-checkpoint-sqlite>=2.0.0
 python-dotenv>=1.0.0
+python-multipart>=0.0.9

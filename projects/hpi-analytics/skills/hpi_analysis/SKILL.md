@@ -64,17 +64,17 @@ The dataset contains indices at different geographic granularities. You must fil
 
 To maintain a clean and isolated system environment, you **must** always use a Python virtual environment when executing scripts or installing dependencies:
 
-1. **Virtual Environment Location**: Use the virtual environment named `venv` located at the project root directory (`./venv`). If it does not exist, initialize it:
+1. **Virtual Environment Location**: Use the SDK-local virtual environment located at `deep-agents-sdk/venv`. If it does not exist, initialize it:
    ```bash
-   python3 -m venv venv
+   python3 -m venv deep-agents-sdk/venv
    ```
 2. **Package Installation**: Never install packages globally. Always install them via the virtual environment's pip binary:
    ```bash
-   ./venv/bin/pip install <package-name>
+   ./deep-agents-sdk/venv/bin/pip install <package-name>
    ```
 3. **Script Execution**: Always run Python scripts using the virtual environment's python binary:
    ```bash
-   ./venv/bin/python <script-path>
+   ./deep-agents-sdk/venv/bin/python <script-path>
    ```
 
 ---

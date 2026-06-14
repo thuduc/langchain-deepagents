@@ -3,123 +3,141 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HPI Explorer - Gemini Agent Sandbox</title>
-    <meta name="description" content="Explore and analyze US Federal Housing Finance Agency (FHFA) House Price Index (HPI) data with a Gemini-style clean UI.">
-    <!-- Google Fonts -->
+    <title>GenAI Projects</title>
+    <meta name="description" content="Project-scoped GenAI workspace with dynamic skills, data, and chat sessions.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
-    <!-- KaTeX for rendering mathematical equations -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
     <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
-    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"></script>
-    <!-- Marked library for parsing markdown -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
-    <div class="app-container">
-        <!-- Sidebar containing metadata & suggestions -->
-        <aside class="sidebar" id="app-sidebar">
-            <div class="sidebar-header">
-                <button class="menu-toggle-btn" id="menu-btn" aria-label="Toggle sidebar width">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="18" x2="20" y2="18"/></svg>
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-top">
+                <button class="icon-button sidebar-collapse-btn" id="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2"></rect><path d="M9 5v14"></path></svg>
                 </button>
-                <div class="app-logo">
-                    <h1>HPI Explorer</h1>
-                </div>
+                <button class="icon-button" id="mobile-close-btn" title="Close sidebar" aria-label="Close sidebar">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+                </button>
             </div>
-            
-            <button class="new-chat-btn" id="clear-chat-btn" title="Start a new chat session">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                <span>New chat</span>
-            </button>
-            
 
-            
-            <div class="sidebar-footer">
-                <div class="session-info">
-                    <span>Session:</span>
-                    <strong id="session-id-display">default-session</strong>
+            <section class="nav-section">
+                <div class="section-header">
+                    <span>Projects</span>
+                    <div class="section-actions">
+                        <button class="icon-button" id="import-project-btn" title="Import project from ZIP" aria-label="Import project from ZIP">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 8 5-5 5 5"></path><path d="M5 15v4h14v-4"></path></svg>
+                        </button>
+                        <button class="icon-button" id="add-project-btn" title="Add project" aria-label="Add project">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                        </button>
+                    </div>
                 </div>
-            </div>
+                <div class="list" id="project-list"></div>
+            </section>
+
+            <section class="nav-section sessions-section">
+                <div class="section-header">
+                    <span>Chats</span>
+                </div>
+                <div class="list" id="session-list"></div>
+            </section>
         </aside>
 
-        <!-- Main Chat Area -->
-        <main class="chat-workspace">
+        <main class="workspace">
             <header class="workspace-header">
-                <div class="header-left">
-                    <button class="menu-toggle-btn header-menu-btn" id="header-menu-btn" aria-label="Toggle sidebar">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="18" x2="20" y2="18"/></svg>
-                    </button>
-                    <div class="model-dropdown">
-                        <span class="model-name">HPI Analyst v2.0</span>
-                    </div>
+                <button class="icon-button mobile-menu" id="mobile-menu-btn" title="Open sidebar" aria-label="Open sidebar">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16"></path><path d="M4 12h16"></path><path d="M4 18h16"></path></svg>
+                </button>
+                <div class="workspace-title">
+                    <strong id="project-title">No project selected</strong>
+                    <span id="session-title">Select a project to begin</span>
                 </div>
-                <div class="header-actions">
-                    <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle dark/light theme">
-                        <!-- Sun Icon (shows in Dark Mode to toggle to Light) -->
-                        <svg class="sun-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-                        <!-- Moon Icon (shows in Light Mode to toggle to Dark) -->
-                        <svg class="moon-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-                    </button>
-
-                </div>
+                <button class="icon-button" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 6 6 0 0 1-9-9Z"></path></svg>
+                </button>
             </header>
 
-            <section class="messages-container" id="chat-log">
-                <!-- Welcome Screen (Gemini Style) -->
-                <div class="welcome-screen" id="welcome-screen">
-                    <div class="welcome-header">
-                        <h2 class="greet-title">Hello, HPI Explorer</h2>
-                        <h3 class="greet-subtitle">How can I help you today?</h3>
-                    </div>
-                    
-                    <div class="suggest-grid" id="sample-prompts-list">
-                        <div class="suggest-card" data-prompt="What is the general difference between state-level HPI and census division HPI?">
-                            <p>Explain state-level vs census division HPI differences</p>
-                            <div class="card-icon">
-                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h10M6 10h10"/></svg>
-                            </div>
-                        </div>
-                        <div class="suggest-card" data-prompt="Calculate California's quarterly HPI growth rate from Q1 2010 to Q1 2020.">
-                            <p>Calculate California's HPI growth rate (Q1 2010 - Q1 2020)</p>
-                            <div class="card-icon">
-                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
-                            </div>
-                        </div>
-                        <div class="suggest-card" data-prompt="Generate a comparison line chart for California, New York, and Texas HPI from 2015 to present.">
-                            <p>Compare HPI CA vs NY vs TX charts from 2015 to present</p>
-                            <div class="card-icon">
-                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
-                            </div>
-                        </div>
-                    </div>
+            <section class="messages" id="chat-log">
+                <div class="empty-state" id="empty-state">
+                    <h1>Select a project</h1>
+                    <p>Choose a project from the sidebar to load its skills, data, and chat sessions.</p>
                 </div>
             </section>
 
-            <!-- Input Form Area -->
-            <footer class="input-panel">
-                <div class="input-container-wrapper">
-                    <div class="input-container">
-                        <textarea 
-                             id="prompt-input" 
-                             placeholder="Enter a prompt here..." 
-                             rows="1"
-                             autocomplete="off"
-                        ></textarea>
-                        <button class="send-button" id="send-btn" aria-label="Send message">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                        </button>
-                    </div>
-                    <div class="disclaimer">
-                        HPI Explorer can make mistakes. Verify critical analytical calculations and reports.
-                    </div>
+            <footer class="composer">
+                <div class="composer-box">
+                    <textarea id="prompt-input" rows="1" placeholder="Select a project to start" disabled></textarea>
+                    <button class="send-button" id="send-btn" title="Send" aria-label="Send" disabled>↑</button>
                 </div>
+                <div class="hint" id="composer-hint">Prompts are scoped to the selected project.</div>
             </footer>
         </main>
     </div>
-    
+
+    <div class="modal-backdrop hidden" id="content-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <div>
+                    <h2>Project Contents</h2>
+                    <p id="content-subtitle"></p>
+                </div>
+                <button class="icon-button" data-close-modal="content-modal" aria-label="Close">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+                </button>
+            </div>
+            <div class="file-tree" id="content-tree"></div>
+        </div>
+    </div>
+
+    <div class="modal-backdrop hidden" id="upload-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <div>
+                    <h2>Review ZIP Import</h2>
+                    <p id="upload-summary"></p>
+                </div>
+                <button class="icon-button" data-close-modal="upload-modal" aria-label="Close">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+                </button>
+            </div>
+            <div class="import-options">
+                <label>
+                    Mode
+                    <select id="import-mode">
+                        <option value="merge">Merge with existing content</option>
+                        <option value="replace">Replace existing content</option>
+                    </select>
+                </label>
+            </div>
+            <div class="file-tree" id="upload-tree"></div>
+            <div class="modal-actions">
+                <button class="secondary-action" data-close-modal="upload-modal">Cancel</button>
+                <button class="primary-action" id="confirm-import-btn">Import</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="project-menu hidden" id="project-menu">
+        <button type="button" data-project-action="contents">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18"></path><path d="M3 12h18"></path><path d="M3 17h18"></path></svg>
+            <span>Contents</span>
+        </button>
+        <button type="button" data-project-action="upload">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 8 5-5 5 5"></path><path d="M5 15v4h14v-4"></path></svg>
+            <span>Upload</span>
+        </button>
+        <button type="button" class="danger-menu-item" data-project-action="delete">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M6 7l1 14h10l1-14"></path><path d="M9 7V4h6v3"></path></svg>
+            <span>Delete</span>
+        </button>
+    </div>
+
+    <input type="file" id="zip-file-input" accept=".zip,application/zip" hidden>
     <script src="/static/app.js"></script>
 </body>
 </html>

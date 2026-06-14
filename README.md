@@ -1,6 +1,6 @@
 # Deep Agents HPI Workspace Application
 
-This workspace contains an interactive web application that implements a multi-agent **Orchestrator-Worker** model (using the LangChain Deep Agents SDK) to analyze US Federal Housing Finance Agency (FHFA) House Price Index (HPI) data.
+This workspace contains an interactive web application that implements a multi-agent **Orchestrator-Worker** model (using the LangChain Deep Agents SDK). The app supports multiple projects, where each project owns its own data, skills, resources, and chat sessions.
 
 The application features a FastAPI REST server that drives a supervisor coordinator agent and dynamically routes tasks to specialized workers that explore data, execute analysis scripts, and generate comparative charts.
 
@@ -10,19 +10,23 @@ The application features a FastAPI REST server that drives a supervisor coordina
 
 ```text
 langchain-deepagents/
-├── README.md                  # This root documentation file
-├── .env-template              # Template for configuring environment variables
-├── data/                      # Contains raw CSV/Excel housing datasets
-├── skills/                    # Repository of specialist agent skills (e.g. hpi_analysis)
-│   └── hpi_analysis/
-│       ├── SKILL.md           # Instructions/Rules for the HPI Specialist Worker
-│       └── references/        # Schema definition & metadata files
-├── examples/                  # Destination for user-saved HPI charts
-├── deep-agents-sdk/           # The active SDK-based implementation
-│   ├── requirements.txt       # Python dependencies for the SDK server
-│   ├── server.py              # FastAPI server, supervisor, & specialist node tool
-│   └── static/                # Gemini-style Web UI (HTML, CSS, JS)
-└── venv/                      # Local Python virtual environment
+├── README.md
+├── .env-template
+├── projects/
+│   └── hpi-analytics/
+│       ├── data/
+│       │   ├── hpi_master.csv
+│       │   └── hpi_dictionary.xlsx
+│       └── skills/
+│           └── hpi_analysis/
+│               ├── SKILL.md
+│               └── references/
+├── examples/
+├── deep-agents-sdk/
+│   ├── requirements.txt
+│   ├── server.py
+│   ├── static/
+│   └── venv/
 ```
 
 ---
@@ -31,24 +35,24 @@ langchain-deepagents/
 
 1. **Portkey API Gateway**: Setup a Portkey account to access the Gateway.
 2. **Google AI Studio Integration**: Integrate Google AI Studio (Gemini 2.5 Flash) with Portkey and obtain the provider slug.
-3. **Datasets**: Ensure that `data/hpi_master.csv` and `data/hpi_dictionary.xlsx` exist in the `data/` folder at the root of the repository.
+3. **Projects**: The default `HPI Analytics` project is stored under `projects/hpi-analytics/`.
 
 ---
 
 ## 3. Setup and Installation
 
-All setup and execution tasks must be run inside the project's local virtual environment (`venv`):
+All setup and execution tasks must use the SDK-local virtual environment (`deep-agents-sdk/venv`):
 
 1. **Activate/Create Virtual Environment**:
-   If the `venv` directory does not exist, initialize it:
+   If `deep-agents-sdk/venv` does not exist, initialize it:
    ```bash
-   python3 -m venv venv
+   python3 -m venv deep-agents-sdk/venv
    ```
 
 2. **Install Dependencies**:
    Install the required Python packages from the SDK package:
    ```bash
-   ./venv/bin/pip install -r deep-agents-sdk/requirements.txt
+   ./deep-agents-sdk/venv/bin/pip install -r deep-agents-sdk/requirements.txt
    ```
 
 ---
@@ -62,13 +66,13 @@ All setup and execution tasks must be run inside the project's local virtual env
    PORTKEY_PROVIDER_SLUG=your_google_provider_slug_in_portkey
    MODEL=gemini-2.5-flash
    TEMPERATURE=0.0
-   SKILLS_DIR=skills
+   PROJECTS_DIR=projects
    ```
 
 2. **Start the FastAPI Server**:
    Launch the uvicorn development server on port 9010:
    ```bash
-   ./venv/bin/python -m uvicorn deep-agents-sdk.server:app --reload --port 9010
+   ./deep-agents-sdk/venv/bin/python -m uvicorn deep-agents-sdk.server:app --reload --port 9010
    ```
 
 3. **Access the Interface**:
@@ -82,19 +86,31 @@ All setup and execution tasks must be run inside the project's local virtual env
 ## 5. REST API Endpoints
 
 - **`GET /`**: Serves the Chat UI frontend (`index.html`).
-- **`POST /api/chat`**: Chat handler interface.
+- **`GET /api/projects`**: Lists available projects.
+- **`POST /api/projects`**: Creates an empty project.
+- **`DELETE /api/projects/{project_id}`**: Deletes the project record and its folder from disk.
+- **`GET /api/projects/{project_id}/contents`**: Lists project files.
+- **`POST /api/uploads/preview`**: Uploads a ZIP and returns its contents for review before import.
+- **`POST /api/projects/import`**: Creates a new project from a previewed ZIP.
+- **`POST /api/projects/{project_id}/contents/import`**: Merges or replaces project content from a previewed ZIP.
+- **`GET /api/projects/{project_id}/sessions`**: Lists chat sessions for a project.
+- **`POST /api/projects/{project_id}/sessions`**: Creates a new chat session.
+- **`GET /api/projects/{project_id}/sessions/{session_id}`**: Loads a chat session and its visible messages.
+- **`POST /api/chat`**: Project-scoped chat handler interface.
   - **Request Body**:
     ```json
     {
+      "project_id": "hpi-analytics",
+      "session_id": "optional-existing-session-id",
       "message": "Calculate California's quarterly HPI growth rate from Q1 2010 to Q1 2020.",
-      "session_id": "optional-custom-session-id"
     }
     ```
   - **Response Body**:
     ```json
     {
+      "project_id": "hpi-analytics",
+      "session_id": "session-id",
       "response": "Based on the HPI dataset, California (CA) experienced a growth of approximately 79.40%...",
-      "session_id": "optional-custom-session-id"
     }
     ```
 - **`GET /static/*`**: Serves static CSS, client JS, and generated charts under `/static/charts/`.
@@ -105,6 +121,7 @@ All setup and execution tasks must be run inside the project's local virtual env
 ## 6. Dynamic Skill Matching (Option B)
 
 This implementation uses **Universal Specialist Injection** to dynamically scale skill loading:
-* **Scanning:** The supervisor agent (`server.py`) scans all subfolders under `SKILLS_DIR` at startup/invocation to retrieve descriptions of available skills from their `SKILL.md` frontmatter.
+* **Scanning:** The supervisor agent (`server.py`) scans all subfolders under the selected project's `skills/` folder to retrieve descriptions of available skills from their `SKILL.md` frontmatter.
 * **Semantic Routing:** The supervisor matches user requests semantically using these descriptions, making a tool call to `specialist_worker`.
 * **On-Demand Loading:** The `specialist_worker` tool lazy-loads the requested skill's guidelines and schema dynamically to spin up a transient specialist worker, keeping the supervisor's context window clean and lightweight.
+* **Project Isolation:** Agent graphs, skill registries, chat sessions, and generated chart paths are scoped to the selected project.
