@@ -492,6 +492,104 @@ button:disabled {
     font-size: 13px;
 }
 
+.workspace-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.run-status,
+.meta-button,
+.meta-chip {
+    min-height: 28px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: var(--panel);
+    color: var(--soft);
+    font-size: 12px;
+}
+
+.run-status {
+    max-width: 260px;
+    padding: 0 10px;
+}
+
+.run-status.hidden,
+.workspace-meta.hidden,
+.artifact-strip.hidden,
+.meta-button.hidden {
+    display: none;
+}
+
+.status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex: 0 0 auto;
+}
+
+.run-status.active .status-dot {
+    background: var(--accent-strong);
+    animation: pulse 1.25s infinite ease-in-out;
+}
+
+.run-status.done .status-dot,
+.meta-chip.ok strong,
+.meta-button.ok {
+    color: #22c55e;
+}
+
+.run-status.done .status-dot {
+    background: #22c55e;
+}
+
+.run-status.error .status-dot,
+.meta-chip.warn strong,
+.meta-button.warn {
+    color: var(--danger);
+}
+
+.run-status.error .status-dot {
+    background: var(--danger);
+}
+
+.meta-button {
+    padding: 0 10px;
+    color: var(--soft);
+}
+
+.meta-button:hover {
+    color: var(--text);
+    background: var(--panel-2);
+}
+
+.workspace-meta {
+    min-height: 36px;
+    padding: 0 22px 8px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    overflow-x: auto;
+}
+
+.meta-chip {
+    padding: 0 9px;
+    white-space: nowrap;
+}
+
+.meta-chip span {
+    color: var(--muted);
+}
+
+.meta-chip strong {
+    color: var(--text);
+    font-weight: 600;
+}
+
 .mobile-menu,
 #mobile-close-btn {
     display: none;
@@ -617,6 +715,10 @@ button:disabled {
     background: var(--panel);
 }
 
+.message.error .message-content {
+    color: var(--danger);
+}
+
 .message-content video,
 .message-content audio {
     display: block;
@@ -668,6 +770,67 @@ button:disabled {
 
 .composer {
     padding: 14px 24px 22px;
+}
+
+.artifact-strip {
+    max-width: 880px;
+    margin: 0 auto 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+}
+
+.artifact-label {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    flex: 0 0 auto;
+}
+
+.artifact-item {
+    max-width: 220px;
+    min-height: 38px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px 8px 4px 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--soft);
+    background: var(--panel);
+    text-decoration: none;
+    font-size: 12px;
+}
+
+.artifact-item:hover {
+    color: var(--text);
+    background: var(--panel-2);
+}
+
+.artifact-item img,
+.artifact-file {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    object-fit: cover;
+    flex: 0 0 auto;
+    background: var(--bg);
+}
+
+.artifact-file {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+}
+
+.artifact-item span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 .composer-box {
@@ -792,6 +955,78 @@ button:disabled {
 
 .settings-modal {
     width: min(460px, 100%);
+}
+
+.isolation-modal {
+    width: min(760px, 100%);
+}
+
+.isolation-body {
+    padding: 18px;
+    overflow: auto;
+}
+
+.isolation-summary {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.isolation-summary div,
+.isolation-check {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 140px minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+}
+
+.isolation-summary span {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.isolation-summary code,
+.isolation-check code {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 7px;
+    background: var(--bg);
+    color: var(--soft);
+    font-size: 12px;
+}
+
+.isolation-checks {
+    display: grid;
+    gap: 7px;
+}
+
+.isolation-check {
+    grid-template-columns: 36px minmax(0, 1fr);
+}
+
+.isolation-check span {
+    min-height: 26px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    background: var(--panel-2);
+}
+
+.isolation-check.ok span {
+    color: #22c55e;
+}
+
+.isolation-check.warn span {
+    color: var(--danger);
 }
 
 .settings-form {

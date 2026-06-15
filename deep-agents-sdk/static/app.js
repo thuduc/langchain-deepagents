@@ -10,6 +10,9 @@ document.addEventListener("DOMContentLoaded", () => {
         pendingProjectName: null,
         menuProjectId: null,
         settings: null,
+        isolationAudit: null,
+        currentMessages: [],
+        runStatusTimer: null,
     };
 
     const els = {
@@ -27,11 +30,19 @@ document.addEventListener("DOMContentLoaded", () => {
         projectMenu: document.getElementById("project-menu"),
         projectTitle: document.getElementById("project-title"),
         sessionTitle: document.getElementById("session-title"),
+        workspaceMeta: document.getElementById("workspace-meta"),
+        runStatus: document.getElementById("run-status"),
+        runStatusText: document.getElementById("run-status-text"),
+        isolationBtn: document.getElementById("isolation-btn"),
+        isolationModal: document.getElementById("isolation-modal"),
+        isolationSubtitle: document.getElementById("isolation-subtitle"),
+        isolationBody: document.getElementById("isolation-body"),
         chatLog: document.getElementById("chat-log"),
         emptyState: document.getElementById("empty-state"),
         promptInput: document.getElementById("prompt-input"),
         sendBtn: document.getElementById("send-btn"),
         composerHint: document.getElementById("composer-hint"),
+        artifactStrip: document.getElementById("artifact-strip"),
         contentModal: document.getElementById("content-modal"),
         contentSubtitle: document.getElementById("content-subtitle"),
         contentTree: document.getElementById("content-tree"),
@@ -49,7 +60,16 @@ document.addEventListener("DOMContentLoaded", () => {
     setupTheme();
     setupMarkdown();
     bindEvents();
-    loadProjects();
+    initializeApp();
+
+    async function initializeApp() {
+        try {
+            await loadSettings();
+        } catch (_) {
+            state.settings = null;
+        }
+        await loadProjects();
+    }
 
     function setupTheme() {
         const savedTheme = localStorage.getItem("theme");
@@ -77,6 +97,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         els.addProjectBtn.addEventListener("click", createEmptyProject);
         els.settingsBtn.addEventListener("click", openSettings);
+        els.isolationBtn.addEventListener("click", openIsolationModal);
         els.saveSettingsBtn.addEventListener("click", saveSettings);
         els.sendBtn.addEventListener("click", sendMessage);
         els.confirmImportBtn.addEventListener("click", confirmImport);
@@ -106,6 +127,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (event.key === "Escape") {
                 closeProjectMenu();
                 closeModal("settings-modal");
+                closeModal("isolation-modal");
             }
         });
 
@@ -154,7 +176,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const projectData = await api(`/api/projects/${projectId}`);
         state.currentProject = projectData.project;
         state.currentSession = null;
+        state.currentMessages = [];
+        state.isolationAudit = null;
         localStorage.setItem("currentProjectId", projectId);
+        await loadProjectIsolation(projectId);
         await loadSessions();
         updateProjectState();
         if (state.sessions.length) {
@@ -170,6 +195,15 @@ document.addEventListener("DOMContentLoaded", () => {
         const data = await api(`/api/projects/${state.currentProject.id}/sessions`);
         state.sessions = data.sessions || [];
         renderSessions();
+    }
+
+    async function loadProjectIsolation(projectId) {
+        try {
+            const data = await api(`/api/projects/${projectId}/isolation`);
+            state.isolationAudit = data.audit || null;
+        } catch (_) {
+            state.isolationAudit = null;
+        }
     }
 
     function renderProjects() {
@@ -256,6 +290,7 @@ document.addEventListener("DOMContentLoaded", () => {
         els.sendBtn.disabled = !hasProject;
         els.promptInput.placeholder = hasProject ? "Ask this project to investigate..." : "Select a project to start";
         els.composerHint.textContent = hasProject ? `Using skills and data from ${state.currentProject.name}.` : "Prompts are scoped to the selected project.";
+        renderWorkspaceMeta();
         renderProjects();
         renderSessions();
     }
@@ -306,7 +341,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 state.currentSession = null;
                 localStorage.setItem("currentProjectId", targetProjectId);
             }
-            await loadSessions();
+            if (Array.isArray(data.sessions)) {
+                state.sessions = data.sessions;
+                renderSessions();
+            } else {
+                await loadSessions();
+            }
             await selectSession(data.session.id);
         } catch (error) {
             window.alert(error.message);
@@ -317,7 +357,8 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!state.currentProject) return;
         const data = await api(`/api/projects/${state.currentProject.id}/sessions/${sessionId}`);
         state.currentSession = data.session;
-        renderMessages(data.messages || []);
+        state.currentMessages = data.messages || [];
+        renderMessages(state.currentMessages);
         updateProjectState();
         els.sidebar.classList.remove("open");
     }
@@ -376,6 +417,7 @@ document.addEventListener("DOMContentLoaded", () => {
             renderSettings(state.settings);
             closeModal("settings-modal");
             await reconcileCurrentSessions();
+            updateProjectState();
         } catch (error) {
             els.settingsStatus.textContent = error.message;
         } finally {
@@ -404,19 +446,87 @@ document.addEventListener("DOMContentLoaded", () => {
     function renderMessages(messages) {
         els.chatLog.innerHTML = "";
         if (!messages.length) {
+            renderArtifacts([]);
             showEmpty("What should we work on?", "This chat is ready for the selected project.");
             return;
         }
         messages.forEach((message) => appendMessage(message.role, message.content, false));
+        renderArtifactsFromDom();
         scrollToBottom();
     }
 
     function showEmpty(title, subtitle) {
         els.chatLog.innerHTML = "";
+        renderArtifacts([]);
         const div = document.createElement("div");
         div.className = "empty-state";
         div.innerHTML = `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(subtitle)}</p>`;
         els.chatLog.appendChild(div);
+    }
+
+    function renderWorkspaceMeta() {
+        const chips = [];
+        const settings = state.settings || {};
+        if (settings.default_model) {
+            chips.push({ label: "Model", value: settings.default_model });
+        }
+        if (state.currentProject) {
+            const skillCount = Array.isArray(state.currentProject.skills) ? state.currentProject.skills.length : 0;
+            chips.push({ label: "Skills", value: String(skillCount) });
+            chips.push({ label: "Chats", value: `${state.sessions.length}/${settings.max_sessions_per_project || 5}` });
+        }
+        if (state.currentSession) {
+            chips.push({ label: "Session", value: shortId(state.currentSession.id) });
+        }
+        if (state.isolationAudit) {
+            chips.push({ label: "Isolation", value: state.isolationAudit.passed ? "Pass" : "Review", tone: state.isolationAudit.passed ? "ok" : "warn" });
+        }
+
+        els.workspaceMeta.innerHTML = "";
+        if (!chips.length) {
+            els.workspaceMeta.classList.add("hidden");
+            els.isolationBtn.classList.add("hidden");
+            return;
+        }
+
+        chips.forEach((chip) => {
+            const span = document.createElement("span");
+            span.className = `meta-chip ${chip.tone || ""}`.trim();
+            span.innerHTML = `<span>${escapeHtml(chip.label)}</span><strong>${escapeHtml(chip.value)}</strong>`;
+            els.workspaceMeta.appendChild(span);
+        });
+        els.workspaceMeta.classList.remove("hidden");
+        els.isolationBtn.classList.toggle("hidden", !state.isolationAudit);
+        els.isolationBtn.classList.toggle("ok", Boolean(state.isolationAudit && state.isolationAudit.passed));
+        els.isolationBtn.classList.toggle("warn", Boolean(state.isolationAudit && !state.isolationAudit.passed));
+    }
+
+    function openIsolationModal() {
+        if (!state.isolationAudit) return;
+        const audit = state.isolationAudit;
+        els.isolationSubtitle.textContent = `${audit.project_name} - ${audit.passed ? "Pass" : "Review"}`;
+        els.isolationBody.innerHTML = "";
+
+        const summary = document.createElement("div");
+        summary.className = "isolation-summary";
+        summary.innerHTML = `
+            <div><span>Project root</span><code>${escapeHtml(audit.project_root)}</code></div>
+            <div><span>Skills source</span><code>${escapeHtml((audit.skills_source || []).map((item) => item.join(": ")).join(", "))}</code></div>
+            <div><span>Checkpoint thread</span><code>${escapeHtml(audit.checkpointing.sample_thread_id)}</code></div>
+            <div><span>Artifact prefix</span><code>${escapeHtml(audit.artifacts.chart_url_prefix)}</code></div>
+        `;
+        els.isolationBody.appendChild(summary);
+
+        const checks = document.createElement("div");
+        checks.className = "isolation-checks";
+        Object.entries(audit.checks || {}).forEach(([name, passed]) => {
+            const row = document.createElement("div");
+            row.className = `isolation-check ${passed ? "ok" : "warn"}`;
+            row.innerHTML = `<span>${passed ? "OK" : "!"}</span><code>${escapeHtml(name)}</code>`;
+            checks.appendChild(row);
+        });
+        els.isolationBody.appendChild(checks);
+        openModal("isolation-modal");
     }
 
     async function sendMessage() {
@@ -429,37 +539,205 @@ document.addEventListener("DOMContentLoaded", () => {
                 body: JSON.stringify({ title: "New chat" }),
             });
             state.currentSession = data.session;
+            if (Array.isArray(data.sessions)) {
+                state.sessions = data.sessions;
+                renderSessions();
+            }
         }
 
         els.promptInput.value = "";
         els.promptInput.style.height = "auto";
         setInputDisabled(true);
+        setRunStatus("Starting agent run", "active");
         clearEmptyState();
         appendMessage("user", text);
-        const typing = appendTyping();
+        state.currentMessages.push({ role: "user", content: text });
+        const assistantMessage = appendStreamingMessage();
 
         try {
-            const data = await api("/api/chat", {
-                method: "POST",
-                body: JSON.stringify({
-                    project_id: state.currentProject.id,
-                    session_id: state.currentSession.id,
-                    message: text,
-                }),
-            });
-            typing.remove();
-            appendMessage("assistant", data.response);
-            await loadSessions();
-            const latest = state.sessions.find((session) => session.id === data.session_id);
-            if (latest) state.currentSession = latest;
-            updateProjectState();
+            await streamChatResponse(text, assistantMessage);
         } catch (error) {
-            typing.remove();
-            appendMessage("assistant", `**System Error:** ${error.message}`);
+            if (error.noFallback) {
+                setRunStatus("Run failed", "error");
+                await loadSessions();
+                updateProjectState();
+            } else {
+                assistantMessage.remove();
+                try {
+                    await sendMessageFallback(text);
+                } catch (fallbackError) {
+                    appendMessage("assistant", `**System Error:** ${fallbackError.message}`).classList.add("error");
+                    setRunStatus("Run failed", "error");
+                }
+            }
         } finally {
             setInputDisabled(false);
             els.promptInput.focus();
         }
+    }
+
+    async function sendMessageFallback(text) {
+        const data = await api("/api/chat", {
+            method: "POST",
+            body: JSON.stringify({
+                project_id: state.currentProject.id,
+                session_id: state.currentSession.id,
+                message: text,
+            }),
+        });
+        appendMessage("assistant", data.response);
+        state.currentMessages.push({ role: "assistant", content: data.response });
+        renderArtifactsFromDom();
+        setRunStatus("Complete", "done", true);
+        await syncSessionAfterChat(data.session_id);
+    }
+
+    async function streamChatResponse(text, assistantMessage) {
+        const response = await fetch("/api/chat/stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                project_id: state.currentProject.id,
+                session_id: state.currentSession.id,
+                message: text,
+            }),
+        });
+        if (!response.ok || !response.body) {
+            throw new Error(`Request failed with ${response.status}`);
+        }
+
+        let buffer = "";
+        let streamedText = "";
+        let finalData = null;
+        let hasStreamEvent = false;
+        const decoder = new TextDecoder();
+        const reader = response.body.getReader();
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split("\n\n");
+            buffer = events.pop() || "";
+            for (const rawEvent of events) {
+                const event = parseStreamEvent(rawEvent);
+                if (!event) continue;
+                hasStreamEvent = true;
+                if (event.type === "status" && !streamedText) {
+                    setRunStatus(event.data.message || "Working", "active");
+                } else if (event.type === "delta") {
+                    setRunStatus("Receiving response", "active");
+                    streamedText += event.data.text || "";
+                    updateStreamingMessage(assistantMessage, streamedText || "_Working..._");
+                } else if (event.type === "final") {
+                    finalData = event.data;
+                    assistantMessage.classList.remove("streaming");
+                    updateStreamingMessage(assistantMessage, finalData.response || streamedText);
+                    state.currentMessages.push({ role: "assistant", content: finalData.response || streamedText });
+                    renderArtifactsFromDom();
+                    setRunStatus("Complete", "done", true);
+                } else if (event.type === "error") {
+                    assistantMessage.classList.remove("streaming");
+                    assistantMessage.classList.add("error");
+                    updateStreamingMessage(assistantMessage, `**System Error:** ${event.data.message || "Streaming request failed"}`);
+                    setRunStatus("Run failed", "error");
+                    const streamError = new Error(event.data.message || "Streaming request failed");
+                    streamError.noFallback = true;
+                    throw streamError;
+                }
+            }
+        }
+
+        if (!finalData) {
+            const streamError = new Error("Streaming response ended without a final answer");
+            streamError.noFallback = hasStreamEvent;
+            throw streamError;
+        }
+        await syncSessionAfterChat(finalData.session_id);
+    }
+
+    function parseStreamEvent(rawEvent) {
+        const lines = rawEvent.split("\n");
+        let type = "message";
+        const dataLines = [];
+        for (const line of lines) {
+            if (line.startsWith("event:")) {
+                type = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+                dataLines.push(line.slice(5).trimStart());
+            }
+        }
+        if (!dataLines.length) return null;
+        try {
+            return { type, data: JSON.parse(dataLines.join("\n")) };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    async function syncSessionAfterChat(sessionId) {
+        await loadSessions();
+        const latest = state.sessions.find((session) => session.id === sessionId);
+        if (latest) state.currentSession = latest;
+        updateProjectState();
+    }
+
+    function setRunStatus(text, tone = "active", autoHide = false) {
+        if (state.runStatusTimer) {
+            window.clearTimeout(state.runStatusTimer);
+            state.runStatusTimer = null;
+        }
+        els.runStatusText.textContent = text;
+        els.runStatus.className = `run-status ${tone}`;
+        if (autoHide) {
+            state.runStatusTimer = window.setTimeout(() => {
+                els.runStatus.classList.add("hidden");
+                state.runStatusTimer = null;
+            }, 2400);
+        }
+    }
+
+    function renderArtifactsFromDom() {
+        const artifacts = [];
+        els.chatLog.querySelectorAll(".message.assistant img, .message.assistant video, .message.assistant audio").forEach((node) => {
+            const src = node.getAttribute("src");
+            if (!src || artifacts.some((artifact) => artifact.src === src)) return;
+            artifacts.push({
+                src,
+                type: node.tagName.toLowerCase(),
+                label: node.getAttribute("alt") || src.split("/").pop() || "Artifact",
+            });
+        });
+        renderArtifacts(artifacts);
+    }
+
+    function renderArtifacts(artifacts) {
+        els.artifactStrip.innerHTML = "";
+        if (!artifacts.length) {
+            els.artifactStrip.classList.add("hidden");
+            return;
+        }
+
+        const label = document.createElement("span");
+        label.className = "artifact-label";
+        label.textContent = "Artifacts";
+        els.artifactStrip.appendChild(label);
+
+        artifacts.forEach((artifact, index) => {
+            const link = document.createElement("a");
+            link.className = "artifact-item";
+            link.href = artifact.src;
+            link.target = "_blank";
+            link.rel = "noreferrer";
+            link.title = artifact.label;
+            if (artifact.type === "img") {
+                link.innerHTML = `<img src="${escapeHtml(artifact.src)}" alt="${escapeHtml(artifact.label)}"><span>${escapeHtml(artifact.label)}</span>`;
+            } else {
+                link.innerHTML = `<span class="artifact-file">${index + 1}</span><span>${escapeHtml(artifact.label)}</span>`;
+            }
+            els.artifactStrip.appendChild(link);
+        });
+        els.artifactStrip.classList.remove("hidden");
     }
 
     function setInputDisabled(disabled) {
@@ -488,6 +766,19 @@ document.addEventListener("DOMContentLoaded", () => {
         els.chatLog.appendChild(div);
         if (shouldScroll) scrollToBottom();
         return div;
+    }
+
+    function appendStreamingMessage() {
+        const div = appendMessage("assistant", "_Starting..._");
+        div.classList.add("streaming");
+        return div;
+    }
+
+    function updateStreamingMessage(messageEl, text) {
+        const content = messageEl.querySelector(".message-content");
+        if (!content) return;
+        content.innerHTML = parseMarkdown(text);
+        scrollToBottom();
     }
 
     function appendTyping() {
@@ -753,6 +1044,11 @@ document.addEventListener("DOMContentLoaded", () => {
             unit += 1;
         }
         return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function shortId(value) {
+        const text = String(value || "");
+        return text.length > 10 ? text.slice(0, 8) : text;
     }
 
     function icon(name) {

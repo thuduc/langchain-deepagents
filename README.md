@@ -18,7 +18,7 @@ langchain-deepagents/
 │       │   ├── hpi_master.csv
 │       │   └── hpi_dictionary.xlsx
 │       └── skills/
-│           └── hpi_analysis/
+│           └── hpi-analysis/
 │               ├── SKILL.md
 │               └── references/
 ├── examples/

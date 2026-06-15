@@ -5,6 +5,9 @@ import shutil
 import sqlite3
 import zipfile
 import subprocess
+import contextvars
+import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
@@ -12,7 +15,7 @@ from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -24,6 +27,13 @@ CHARTS_DIR = STATIC_DIR / "charts"
 TMP_UPLOADS_DIR = SDK_DIR / "tmp_uploads"
 TMP_EXEC_DIR = SDK_DIR / "tmp_execution"
 DB_PATH = SDK_DIR / "checkpoints.db"
+AGENT_CHECKPOINT_DB_PATH = SDK_DIR / "agent_checkpoints.db"
+
+logger = logging.getLogger(__name__)
+CURRENT_AGENT_SESSION_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_agent_session_id",
+    default="default",
+)
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -45,10 +55,16 @@ MEDIA_PATH_RE = re.compile(
     r"(?:[\w .-]+/)+[\w .-]+?\.(?:png|jpe?g|gif|webp|svg|mp4|webm|mov|m4v|mp3|wav|ogg|m4a|pdf))",
     re.IGNORECASE,
 )
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((?P<href>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
+HTML_MEDIA_SRC_RE = re.compile(r"<(?:img|video|audio)\b[^>]*\bsrc=[\"'](?P<src>[^\"']+)[\"']", re.IGNORECASE)
 MEDIA_LABEL_RE = re.compile(
     r"^\s*(?:file|image|chart|plot|graph|figure|video|audio|media|output)?\s*"
     r"(?:saved|created|generated|written|exported)?\s*(?:file|image|chart|plot|graph|figure|video|audio|media|output)?\s*"
     r"(?:at|to|as|path)?\s*:?\s*$",
+    re.IGNORECASE,
+)
+TRAILING_MEDIA_LABEL_RE = re.compile(
+    r"\s+(?:file|image|chart|plot|graph|figure|video|audio|media|output)?\s*(?:path|url|link)\s*:?\s*$",
     re.IGNORECASE,
 )
 DEFAULT_AVAILABLE_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-codex"]
@@ -93,6 +109,19 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+SENSITIVE_FILESYSTEM_PATTERNS = [
+    "/.env",
+    "/.env.*",
+    "/**/.env",
+    "/**/.env.*",
+    "/checkpoints.db",
+    "/checkpoints.db-*",
+    "/agent_checkpoints.db",
+    "/agent_checkpoints.db-*",
+]
+PROJECT_FILESYSTEM_ALLOW_PATTERNS = ["/**"]
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -111,8 +140,21 @@ def slugify(name: str) -> str:
     return slug or f"project-{uuid.uuid4().hex[:8]}"
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=10,
+        check_same_thread=False,
+        factory=ClosingSQLiteConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")
@@ -164,6 +206,7 @@ def init_db() -> None:
         )
         seed_default_project(conn)
     prune_all_project_sessions()
+    validate_all_project_skills_once()
 
 
 def seed_default_project(conn: sqlite3.Connection) -> None:
@@ -301,6 +344,21 @@ def prune_all_project_sessions(max_sessions: Optional[int] = None) -> None:
         prune_project_sessions(row["id"], limit)
 
 
+def list_project_sessions(project_id: str, prune: bool = True) -> List[Dict[str, Any]]:
+    if prune:
+        prune_project_sessions(project_id)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM chat_sessions
+            WHERE project_id = ?
+            ORDER BY updated_at DESC, created_at DESC, id DESC
+            """,
+            (project_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
@@ -337,6 +395,90 @@ def get_project_root(project_id: str) -> Path:
 
 def get_skill_dir(project_id: str) -> Path:
     return get_project_root(project_id) / "skills"
+
+
+def project_skills_source(project: Dict[str, Any]) -> List[tuple[str, str]]:
+    return [("/skills", project["name"])]
+
+
+def project_filesystem_permission_specs() -> List[Dict[str, Any]]:
+    return [
+        {
+            "operations": ["read", "write"],
+            "paths": SENSITIVE_FILESYSTEM_PATTERNS.copy(),
+            "mode": "deny",
+        },
+        {
+            "operations": ["read", "write"],
+            "paths": PROJECT_FILESYSTEM_ALLOW_PATTERNS.copy(),
+            "mode": "allow",
+        },
+    ]
+
+
+def project_chart_context(project: Dict[str, Any], session_id: str, create: bool = True) -> Dict[str, str]:
+    chart_dir = CHARTS_DIR / project["slug"] / session_id
+    if create:
+        chart_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "session_id": session_id,
+        "chart_directory": str(chart_dir),
+        "chart_url_prefix": f"/static/charts/{project['slug']}/{session_id}/",
+    }
+
+
+def project_isolation_audit(project_id: str) -> Dict[str, Any]:
+    project = get_project(project_id)
+    project_root = Path(project["path"])
+    projects_dir = get_projects_dir()
+    skills_dir = get_skill_dir(project_id)
+    skills = scan_project_skills(project_id)
+    sample_session_id = "isolation-audit"
+    chart_context = project_chart_context(project, sample_session_id, create=False)
+    chart_dir = Path(chart_context["chart_directory"]).resolve()
+
+    checks = {
+        "project_root_within_projects_dir": project_root == projects_dir or projects_dir in project_root.parents,
+        "skills_dir_within_project_root": skills_dir == project_root or project_root in skills_dir.parents,
+        "skills_are_project_local": all(
+            (skills_dir / skill["name"] / "SKILL.md").resolve().is_file()
+            and project_root in (skills_dir / skill["name"] / "SKILL.md").resolve().parents
+            for skill in skills
+        ),
+        "checkpoint_threads_include_project_and_session": (
+            session_thread_id(project_id, sample_session_id)
+            == f"project:{project_id}:session:{sample_session_id}"
+        ),
+        "agent_checkpoints_separate_from_app_db": AGENT_CHECKPOINT_DB_PATH.resolve() != DB_PATH.resolve(),
+        "chart_directory_project_session_scoped": (
+            chart_dir == (CHARTS_DIR / project["slug"] / sample_session_id).resolve()
+        ),
+        "chart_url_project_session_scoped": (
+            chart_context["chart_url_prefix"] == f"/static/charts/{project['slug']}/{sample_session_id}/"
+        ),
+    }
+
+    return {
+        "project_id": project_id,
+        "project_name": project["name"],
+        "project_root": str(project_root),
+        "skills_dir": str(skills_dir),
+        "skills": skills,
+        "skills_source": project_skills_source(project),
+        "filesystem_backend": {
+            "root_dir": str(project_root),
+            "virtual_mode": True,
+        },
+        "filesystem_permissions": project_filesystem_permission_specs(),
+        "checkpointing": {
+            "app_db": str(DB_PATH),
+            "agent_checkpoint_db": str(AGENT_CHECKPOINT_DB_PATH),
+            "sample_thread_id": session_thread_id(project_id, sample_session_id),
+        },
+        "artifacts": chart_context,
+        "checks": checks,
+        "passed": all(checks.values()),
+    }
 
 
 def touch_project(project_id: str) -> None:
@@ -474,16 +616,42 @@ def line_without_media_paths(line: str, paths: List[str]) -> str:
     return remainder.strip(" \t:-`'\"")
 
 
+def media_urls_already_embedded(project_id: str, line: str) -> set[str]:
+    urls: set[str] = set()
+    for match in MARKDOWN_IMAGE_RE.finditer(line):
+        media = resolve_media_reference(project_id, match.group("href"))
+        urls.add(media["url"] if media else match.group("href"))
+    for match in HTML_MEDIA_SRC_RE.finditer(line):
+        media = resolve_media_reference(project_id, match.group("src"))
+        urls.add(media["url"] if media else match.group("src"))
+    return urls
+
+
+def embedded_media_spans(line: str) -> List[tuple[int, int]]:
+    spans = [match.span() for match in MARKDOWN_IMAGE_RE.finditer(line)]
+    spans.extend(match.span() for match in HTML_MEDIA_SRC_RE.finditer(line))
+    return spans
+
+
+def span_inside_any(start: int, end: int, spans: List[tuple[int, int]]) -> bool:
+    return any(span_start <= start and end <= span_end for span_start, span_end in spans)
+
+
 def normalize_project_media_links(project_id: str, text: str) -> str:
     """Replace local generated media paths with embeddable project media links."""
     output: List[str] = []
+    embedded_urls: set[str] = set()
 
     for line in text.splitlines():
-        if re.search(r"!\[[^\]]*\]\([^)]+\)", line) or "<video" in line or "<audio" in line:
-            output.append(line)
-            continue
+        existing_line_urls = media_urls_already_embedded(project_id, line)
+        embedded_urls.update(existing_line_urls)
+        protected_spans = embedded_media_spans(line)
 
-        matches = list(MEDIA_PATH_RE.finditer(line))
+        matches = [
+            match
+            for match in MEDIA_PATH_RE.finditer(line)
+            if not span_inside_any(match.start("path"), match.end("path"), protected_spans)
+        ]
         media_items: List[Dict[str, str]] = []
         for match in matches:
             media = resolve_media_reference(project_id, match.group("path"))
@@ -497,7 +665,30 @@ def normalize_project_media_links(project_id: str, text: str) -> str:
 
         raw_paths = [item["raw"] for item in media_items]
         remainder = line_without_media_paths(line, raw_paths)
-        embeds = [media_embed_markdown(item) for item in media_items]
+        new_media_items: List[Dict[str, str]] = []
+        duplicate_paths: List[str] = []
+        seen_line_urls: set[str] = set()
+        for item in media_items:
+            url = item["url"]
+            if url in embedded_urls or url in seen_line_urls:
+                duplicate_paths.append(item["raw"])
+                continue
+            new_media_items.append(item)
+            seen_line_urls.add(url)
+
+        if not new_media_items:
+            cleaned_line = line
+            for path in duplicate_paths:
+                cleaned_line = cleaned_line.replace(path, "")
+            if existing_line_urls:
+                cleaned_line = TRAILING_MEDIA_LABEL_RE.sub("", cleaned_line)
+            cleaned_remainder = cleaned_line.strip(" \t:-`'\"")
+            if cleaned_remainder and not MEDIA_LABEL_RE.match(cleaned_remainder):
+                output.append(cleaned_line.rstrip(" \t:-"))
+            continue
+
+        embeds = [media_embed_markdown(item) for item in new_media_items]
+        embedded_urls.update(item["url"] for item in new_media_items)
 
         if not remainder or MEDIA_LABEL_RE.match(remainder):
             label_index = len(output) - 1
@@ -511,11 +702,92 @@ def normalize_project_media_links(project_id: str, text: str) -> str:
             continue
 
         normalized_line = line
-        for item, embed in zip(media_items, embeds):
-            normalized_line = normalized_line.replace(item["raw"], f"\n\n{embed}\n\n")
+        for item, embed in zip(new_media_items, embeds):
+            normalized_line = normalized_line.replace(item["raw"], f"\n\n{embed}\n\n", 1)
+        for path in duplicate_paths:
+            normalized_line = normalized_line.replace(path, "")
         output.append(normalized_line)
 
     return "\n".join(output)
+
+
+_SKILLS_VALIDATED = False
+
+
+def parse_skill_frontmatter(skill_md: Path) -> Dict[str, str]:
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Could not read skill file %s: %s", skill_md, exc)
+        return {}
+
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        logger.warning("Skill file %s has no YAML frontmatter", skill_md)
+        return {}
+
+    metadata: Dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip()] = value.strip().strip("\"'")
+    return metadata
+
+
+def validate_skill_metadata(skill_dir: Path) -> None:
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return
+
+    metadata = parse_skill_frontmatter(skill_md)
+    name = metadata.get("name", "")
+    description = metadata.get("description", "")
+    if not name or not description:
+        logger.warning("Skill %s is missing required name or description frontmatter", skill_md)
+        return
+
+    if name != skill_dir.name:
+        logger.warning(
+            "Skill %s frontmatter name %r does not match folder name %r",
+            skill_md,
+            name,
+            skill_dir.name,
+        )
+
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name):
+        logger.warning(
+            "Skill %s name %r is not Agent Skills spec-compliant; use lowercase "
+            "alphanumeric words separated by single hyphens for full compliance",
+            skill_md,
+            name,
+        )
+
+
+def validate_project_skills(project_id: str) -> None:
+    skills_dir = get_skill_dir(project_id)
+    if not skills_dir.exists():
+        return
+
+    for skill_dir in sorted(skills_dir.iterdir()):
+        if skill_dir.is_dir():
+            validate_skill_metadata(skill_dir)
+
+
+def validate_all_project_skills_once() -> None:
+    global _SKILLS_VALIDATED
+    if _SKILLS_VALIDATED:
+        return
+
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute("SELECT id FROM projects").fetchall()
+        for row in rows:
+            validate_project_skills(row["id"])
+    except Exception as exc:
+        logger.warning("Could not validate project skills: %s", exc)
+    finally:
+        _SKILLS_VALIDATED = True
 
 
 def scan_project_skills(project_id: str) -> List[Dict[str, str]]:
@@ -807,17 +1079,16 @@ def execute_python_code(code: str, cwd: Path) -> str:
             pass
 
 
-def load_skill_prompt(project_id: str, skill_name: str, session_id: str) -> str:
+def load_skill_prompt(project_id: str, skill_name: str, session_id: Optional[str] = None) -> str:
     project = get_project(project_id)
     project_root = Path(project["path"])
     skill_path = project_root / "skills" / skill_name / "SKILL.md"
     references_dir = project_root / "skills" / skill_name / "references"
-    chart_dir = CHARTS_DIR / project["slug"] / session_id
-    chart_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = (
         f"You are an advanced specialist worker executing tasks for the skill '{skill_name}'.\n"
         f"The selected project is '{project['name']}'. All relative file paths are resolved from this project root: {project_root}.\n"
+        "Use Deep Agents filesystem tools with absolute virtual paths such as '/data/file.csv' when reading or writing project files.\n"
     )
 
     if skill_path.exists():
@@ -838,37 +1109,33 @@ def load_skill_prompt(project_id: str, skill_name: str, session_id: str) -> str:
         "\nCore Objective: Analyze the task instructions, formulate python code to explore data or plot charts, "
         "run the code using the execute_python tool, and present the final answer to the user. "
         "When reading project data, use paths relative to the selected project root, such as 'data/<filename>'. "
-        "If the user asks for charts, save image files to this absolute directory: "
-        f"'{chart_dir}'. Return markdown image links using this URL prefix: "
-        f"'/static/charts/{project['slug']}/{session_id}/<filename>'. "
         "Do not present local filesystem paths for generated media in the final answer; embed the media with markdown instead. "
         "Always use index_nsa unless seasonally adjusted index_sa is specifically requested."
     )
+    if session_id:
+        chart_context = project_chart_context(project, session_id)
+        prompt += (
+            " If the user asks for charts, save image files to this absolute directory: "
+            f"'{chart_context['chart_directory']}'. Return markdown image links using this URL prefix: "
+            f"'{chart_context['chart_url_prefix']}<filename>'."
+        )
+    else:
+        prompt += (
+            " If the user asks for charts, call get_project_context first, save image files to the returned "
+            "chart_directory, and return markdown image links using the returned chart_url_prefix."
+        )
     return prompt
 
 
 def get_supervisor_system_prompt(project_id: str) -> str:
     project = get_project(project_id)
-    skills = scan_project_skills(project_id)
-    prompt = (
+    return (
         "You are a supervisor coordinator. Your goal is to analyze the user prompt and coordinate the plan.\n"
-        "You have access to specialist skills for the currently selected project only. "
-        f"The selected project is '{project['name']}'.\n\n"
-        "Available Skills:\n"
+        "Use the Deep Agents skills library and task tool for the currently selected project to decide which specialist "
+        f"capability applies. The selected project is '{project['name']}'.\n\n"
+        "Core Objective: Analyze the user's request. Create a plan, delegate substantive analysis to the best "
+        "project-specific subagent using the task tool, synthesize the subagent result, and present the final answer."
     )
-
-    if skills:
-        for skill in skills:
-            prompt += f"- '{skill['name']}': {skill['description']}\n"
-    else:
-        prompt += "- No project skills are currently available.\n"
-
-    prompt += (
-        "\nCore Objective: Analyze the user's request. Create a plan and delegate sub-tasks to the "
-        "'specialist_worker' by specifying the correct 'skill_name' and 'task_description'. "
-        "Collect the execution results from the specialist, synthesize the findings, and present the final answer."
-    )
-    return prompt
 
 
 def get_llm_instance():
@@ -898,11 +1165,71 @@ def get_llm_instance():
     )
 
 
+def build_skill_subagents(
+    project_id: str,
+    skills_source: List[Any],
+    tools: List[Any],
+) -> List[Dict[str, Any]]:
+    subagents: List[Dict[str, Any]] = []
+    for skill in scan_project_skills(project_id):
+        skill_name = skill["name"]
+        subagents.append(
+            {
+                "name": skill_name,
+                "description": skill["description"],
+                "system_prompt": load_skill_prompt(project_id, skill_name),
+                "tools": tools,
+                "skills": skills_source,
+            }
+        )
+    return subagents
+
+
+def agent_run_config(project_id: str, session_id: str) -> Dict[str, Any]:
+    return {
+        "configurable": {"thread_id": session_thread_id(project_id, session_id)},
+        "recursion_limit": 100,
+    }
+
+
+def response_text_from_agent_result(result: Dict[str, Any]) -> str:
+    messages = result.get("messages", [])
+    if messages:
+        last_msg = messages[-1]
+        if hasattr(last_msg, "content"):
+            response_text = message_content_to_text(last_msg.content)
+        elif isinstance(last_msg, dict):
+            response_text = message_content_to_text(last_msg.get("content", ""))
+        else:
+            response_text = str(last_msg)
+        if response_text.strip():
+            return response_text
+
+    return "The model returned an empty response for this request. Please try again or rephrase your prompt."
+
+
 _agent_graphs: Dict[str, Any] = {}
+_active_agent_sessions: Dict[str, str] = {}
 
 
 def invalidate_project_agent(project_id: str) -> None:
     _agent_graphs.pop(project_id, None)
+
+
+def set_active_agent_session(project_id: str, session_id: str) -> None:
+    _active_agent_sessions[project_id] = session_id
+
+
+def clear_active_agent_session(project_id: str, session_id: str) -> None:
+    if _active_agent_sessions.get(project_id) == session_id:
+        _active_agent_sessions.pop(project_id, None)
+
+
+def current_agent_session_id(project_id: str) -> str:
+    session_id = CURRENT_AGENT_SESSION_ID.get()
+    if session_id == "default":
+        return _active_agent_sessions.get(project_id, session_id)
+    return session_id
 
 
 def get_agent_graph(project_id: str):
@@ -910,21 +1237,19 @@ def get_agent_graph(project_id: str):
         return _agent_graphs[project_id]
 
     from langchain_core.tools import tool
-    from deepagents import create_deep_agent
+    from deepagents import FilesystemPermission, create_deep_agent
+    from deepagents.backends import FilesystemBackend
     from langgraph.checkpoint.sqlite import SqliteSaver
 
-    project_root = get_project_root(project_id)
+    project = get_project(project_id)
+    project_root = Path(project["path"])
+    backend = FilesystemBackend(root_dir=project_root, virtual_mode=True)
+    skills = project_skills_source(project)
+    permissions = [
+        FilesystemPermission(**permission_spec)
+        for permission_spec in project_filesystem_permission_specs()
+    ]
     llm = get_llm_instance()
-
-    @tool
-    def read_file(path: str) -> str:
-        """Read a file inside the selected project folder."""
-        return read_project_file(project_id, path)
-
-    @tool
-    def write_file(path: str, content: str) -> str:
-        """Write content to a file inside the selected project folder."""
-        return write_project_file(project_id, path, content)
 
     @tool
     def execute_python(code: str) -> str:
@@ -932,47 +1257,35 @@ def get_agent_graph(project_id: str):
         return execute_python_code(code, project_root)
 
     @tool
-    def specialist_worker(skill_name: str, task_description: str) -> str:
-        """
-        Invoke a specialist worker using one skill from the selected project.
+    def get_project_context() -> Dict[str, str]:
+        """Return the selected project root and current session chart output locations."""
+        session_id = current_agent_session_id(project_id)
+        chart_context = project_chart_context(project, session_id)
+        return {
+            "project_name": project["name"],
+            "project_root": str(project_root),
+            **chart_context,
+        }
 
-        Args:
-            skill_name: The project skill folder name to load.
-            task_description: Detailed task instructions for the specialist.
-        """
-        worker_llm = get_llm_instance()
-        current_session_id = getattr(specialist_worker, "_session_id", "default")
-        system_prompt = load_skill_prompt(project_id, skill_name, current_session_id)
+    specialist_tools = [execute_python, get_project_context]
+    subagents = build_skill_subagents(project_id, skills, specialist_tools)
 
-        try:
-            transient_agent = create_deep_agent(
-                model=worker_llm,
-                tools=[read_file, write_file, execute_python],
-                system_prompt=system_prompt,
-            )
-            result = transient_agent.invoke(
-                {"messages": [{"role": "user", "content": task_description}]}
-            )
-            messages = result.get("messages", [])
-            if messages:
-                return message_content_to_text(messages[-1].content)
-            return "Specialist completed the task but returned no content."
-        except Exception as exc:
-            return f"Error executing task using skill '{skill_name}': {str(exc)}"
-
-    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    AGENT_CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(AGENT_CHECKPOINT_DB_PATH, timeout=10, check_same_thread=False)
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")
     checkpointer = SqliteSaver(conn)
 
     graph = create_deep_agent(
         model=llm,
-        tools=[specialist_worker],
-        subagents=[],
+        tools=[],
+        skills=skills,
+        backend=backend,
+        permissions=permissions,
+        subagents=subagents,
         system_prompt=get_supervisor_system_prompt(project_id),
         checkpointer=checkpointer,
     )
-    graph._specialist_worker_tool = specialist_worker
     _agent_graphs[project_id] = graph
     return graph
 
@@ -983,32 +1296,166 @@ def run_agent(project_id: str, session_id: str, prompt: str) -> str:
 
     try:
         agent = get_agent_graph(project_id)
-        if hasattr(agent, "_specialist_worker_tool"):
-            setattr(agent._specialist_worker_tool, "_session_id", session_id)
+        set_active_agent_session(project_id, session_id)
+        session_token = CURRENT_AGENT_SESSION_ID.set(session_id)
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config=agent_run_config(project_id, session_id),
+            )
+        finally:
+            try:
+                CURRENT_AGENT_SESSION_ID.reset(session_token)
+            except ValueError:
+                CURRENT_AGENT_SESSION_ID.set("default")
+            clear_active_agent_session(project_id, session_id)
 
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": prompt}]},
-            config={
-                "configurable": {"thread_id": session_thread_id(project_id, session_id)},
-                "recursion_limit": 100,
-            },
-        )
-
-        messages = result.get("messages", [])
-        if messages:
-            last_msg = messages[-1]
-            if hasattr(last_msg, "content"):
-                response_text = message_content_to_text(last_msg.content)
-            elif isinstance(last_msg, dict):
-                response_text = message_content_to_text(last_msg.get("content", ""))
-            else:
-                response_text = str(last_msg)
-            if response_text.strip():
-                return response_text
-
-        return "The model returned an empty response for this request. Please try again or rephrase your prompt."
+        return response_text_from_agent_result(result)
     except Exception as exc:
         return f"Error invoking agent runner: {str(exc)}. Please check your environment configuration and PORTKEY_API_KEY."
+
+
+def sse_event(event_type: str, data: Dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def chunk_parts(chunk: Any) -> tuple[tuple[str, ...], str, Any]:
+    if isinstance(chunk, tuple) and len(chunk) == 3:
+        namespace, mode, data = chunk
+        return tuple(namespace or ()), str(mode), data
+    if isinstance(chunk, tuple) and len(chunk) == 2:
+        mode, data = chunk
+        return (), str(mode), data
+    if isinstance(chunk, dict) and "type" in chunk:
+        return tuple(chunk.get("ns") or ()), str(chunk["type"]), chunk.get("data")
+    return (), "unknown", chunk
+
+
+def task_status_from_event(namespace: tuple[str, ...], data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+
+    name = str(data.get("name", ""))
+    if not name:
+        return None
+
+    is_subagent = bool(namespace)
+    display_name = namespace[-1].split(":")[0] if is_subagent else name
+    if "input" in data and name == "model":
+        return f"{display_name} is thinking" if is_subagent else "Supervisor is thinking"
+    if "input" in data and name == "tools":
+        return f"{display_name} is using tools" if is_subagent else "Using tools"
+    if "input" in data and name == "task":
+        return "Starting specialist task"
+    if "result" in data and name == "task":
+        return "Specialist task completed"
+    return None
+
+
+def delta_from_message_event(namespace: tuple[str, ...], data: Any) -> str:
+    if namespace or not isinstance(data, tuple) or len(data) != 2:
+        return ""
+
+    message, metadata = data
+    if isinstance(metadata, dict) and metadata.get("langgraph_node") != "model":
+        return ""
+
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+        return "".join(parts)
+    return ""
+
+
+def final_text_from_update(namespace: tuple[str, ...], data: Any) -> str:
+    if namespace or not isinstance(data, dict):
+        return ""
+
+    for update in data.values():
+        if not isinstance(update, dict):
+            continue
+        messages = update.get("messages")
+        if not messages:
+            continue
+        text = message_content_to_text(messages[-1].content if hasattr(messages[-1], "content") else messages[-1])
+        if text.strip():
+            return text
+    return ""
+
+
+def stream_agent_events(project_id: str, session_id: str, prompt: str):
+    if not os.environ.get("PORTKEY_API_KEY"):
+        yield sse_event("status", {"message": "Running local fallback"})
+        response_text = normalize_project_media_links(project_id, simulate_agent_response(project_id, session_id, prompt))
+        add_chat_message(project_id, session_id, "assistant", response_text)
+        yield sse_event(
+            "final",
+            {"response": response_text, "project_id": project_id, "session_id": session_id},
+        )
+        return
+
+    final_text = ""
+    emitted_delta = False
+    try:
+        agent = get_agent_graph(project_id)
+        set_active_agent_session(project_id, session_id)
+        session_token = CURRENT_AGENT_SESSION_ID.set(session_id)
+        try:
+            yield sse_event("status", {"message": "Starting agent run"})
+            for chunk in agent.stream(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config=agent_run_config(project_id, session_id),
+                stream_mode=["updates", "messages", "tasks"],
+                subgraphs=True,
+            ):
+                namespace, mode, data = chunk_parts(chunk)
+
+                if mode == "tasks":
+                    status = task_status_from_event(namespace, data)
+                    if status:
+                        yield sse_event("status", {"message": status})
+                    continue
+
+                if mode == "messages":
+                    delta = delta_from_message_event(namespace, data)
+                    if delta:
+                        emitted_delta = True
+                        yield sse_event("delta", {"text": delta})
+                    continue
+
+                if mode == "updates":
+                    update_text = final_text_from_update(namespace, data)
+                    if update_text:
+                        final_text = update_text
+        finally:
+            try:
+                CURRENT_AGENT_SESSION_ID.reset(session_token)
+            except ValueError:
+                CURRENT_AGENT_SESSION_ID.set("default")
+            clear_active_agent_session(project_id, session_id)
+
+        if not final_text:
+            final_text = "The model returned an empty response for this request. Please try again or rephrase your prompt."
+
+        response_text = normalize_project_media_links(project_id, final_text)
+        add_chat_message(project_id, session_id, "assistant", response_text)
+        if not emitted_delta:
+            yield sse_event("delta", {"text": response_text})
+        yield sse_event(
+            "final",
+            {"response": response_text, "project_id": project_id, "session_id": session_id},
+        )
+    except Exception as exc:
+        error_text = f"Error invoking agent runner: {str(exc)}. Please check your environment configuration and PORTKEY_API_KEY."
+        add_chat_message(project_id, session_id, "assistant", error_text)
+        yield sse_event("error", {"message": error_text})
 
 
 def simulate_agent_response(project_id: str, session_id: str, prompt: str) -> str:
@@ -1097,7 +1544,9 @@ def api_list_projects():
 
 @app.post("/api/projects")
 def api_create_project(request: ProjectCreateRequest):
-    return {"project": create_project_record(request.name)}
+    project = create_project_record(request.name)
+    validate_project_skills(project["id"])
+    return {"project": project}
 
 
 @app.get("/api/projects/{project_id}")
@@ -1105,6 +1554,11 @@ def api_get_project(project_id: str):
     project = get_project(project_id)
     project["skills"] = scan_project_skills(project_id)
     return {"project": project}
+
+
+@app.get("/api/projects/{project_id}/isolation")
+def api_project_isolation(project_id: str):
+    return {"audit": project_isolation_audit(project_id)}
 
 
 @app.delete("/api/projects/{project_id}")
@@ -1160,6 +1614,7 @@ def api_import_project(request: ProjectImportRequest):
     zip_path = upload_path_for_token(request.upload_token)
     extract_zip(zip_path, Path(project["path"]), request.mode)
     touch_project(project["id"])
+    validate_project_skills(project["id"])
     invalidate_project_agent(project["id"])
     return {"project": get_project(project["id"])}
 
@@ -1170,6 +1625,7 @@ def api_import_project_contents(project_id: str, request: ContentImportRequest):
     zip_path = upload_path_for_token(request.upload_token)
     extract_zip(zip_path, project_root, request.mode)
     touch_project(project_id)
+    validate_project_skills(project_id)
     invalidate_project_agent(project_id)
     return {"project": get_project(project_id), "items": list_project_files(project_root)}
 
@@ -1186,22 +1642,13 @@ def api_project_media(project_id: str, media_path: str):
 @app.get("/api/projects/{project_id}/sessions")
 def api_list_sessions(project_id: str):
     get_project(project_id)
-    prune_project_sessions(project_id)
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM chat_sessions
-            WHERE project_id = ?
-            ORDER BY updated_at DESC, created_at DESC, id DESC
-            """,
-            (project_id,),
-        ).fetchall()
-    return {"sessions": [dict(row) for row in rows]}
+    return {"sessions": list_project_sessions(project_id)}
 
 
 @app.post("/api/projects/{project_id}/sessions")
 def api_create_session(project_id: str, request: SessionCreateRequest):
-    return {"session": create_session(project_id, request.title)}
+    session = create_session(project_id, request.title)
+    return {"session": session, "sessions": list_project_sessions(project_id)}
 
 
 @app.get("/api/projects/{project_id}/sessions/{session_id}")
@@ -1258,6 +1705,31 @@ def api_chat(request: ChatRequest):
         response=response_text,
         project_id=request.project_id,
         session_id=session_id,
+    )
+
+
+@app.post("/api/chat/stream")
+def api_chat_stream(request: ChatRequest):
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    get_project(request.project_id)
+
+    session_id = request.session_id
+    if session_id:
+        get_session(request.project_id, session_id)
+    else:
+        session_id = create_session(request.project_id)["id"]
+
+    maybe_title_session(request.project_id, session_id, request.message)
+    add_chat_message(request.project_id, session_id, "user", request.message)
+
+    return StreamingResponse(
+        stream_agent_events(request.project_id, session_id, request.message),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

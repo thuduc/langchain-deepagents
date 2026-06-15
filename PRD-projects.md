@@ -6,7 +6,7 @@ Current the deep-agents-sdk implementation supports skills under skills/ folder.
 - Each project will have a project name, whose name will be used to create a directory for it under the projects folder as defined in PROJECTS_DIR variable
 - Each project will have multiple child folders. Currently we only use 2 child folders: data and skills. But others could be added and used per project.
 - Use a database table to maintain a list of projects
-- Create a new project called "HPI Analytics" under the projects/ folder. Move the skills/hpi_analysis/SKILL.md to this project's skills child folder. Also move the data directory, currently under the project's root, to under this new project
+- Create a new project called "HPI Analytics" under the projects/ folder. Move the skills/hpi-analysis/SKILL.md to this project's skills child folder. Also move the data directory, currently under the project's root, to under this new project
 - The UI should be updated to look similar to the OpenAI Codex app, where the left pane shows a list of current projects.
 - Add the ability to add a new project as well as the following:
   - Allow user to upload a zip file containing data, skills, etc.

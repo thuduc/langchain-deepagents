@@ -1,6 +1,6 @@
 # Testing the HPI Analysis Skill in Codex
 
-This directory contains the `hpi_analysis` agent skill. Since the skill is fully data-centric and metadata-driven, it does not use static code scripts. Instead, it provides files location, schemas, data quirks, and virtual environment instructions to the LLM agent, allowing it to write and run its own code on the fly.
+This directory contains the `hpi-analysis` agent skill. Since the skill is fully data-centric and metadata-driven, it does not use static code scripts. Instead, it provides files location, schemas, data quirks, and virtual environment instructions to the LLM agent, allowing it to write and run its own code on the fly.
 
 ## How to Install in a New Project
 
@@ -15,8 +15,8 @@ To use this HPI analysis skill in a brand new project, follow these exact steps:
    - `data/hpi_dictionary.xlsx`
 
 3. **Copy the Skill Configuration**:
-   Copy the entire `hpi_analysis` skill folder into the `skills/` directory of your new project:
-   - Destination path: `skills/hpi_analysis/` (must contain `SKILL.md` and the `references/hpi_metadata.json` metadata file).
+   Copy the entire `hpi-analysis` skill folder into the `skills/` directory of your new project:
+   - Destination path: `skills/hpi-analysis/` (must contain `SKILL.md` and the `references/hpi_metadata.json` metadata file).
 
 4. **Verify the Layout**:
    Your new project folder should look like this:
@@ -26,7 +26,7 @@ To use this HPI analysis skill in a brand new project, follow these exact steps:
    │   ├── hpi_master.csv
    │   └── hpi_dictionary.xlsx
    └── skills/
-       └── hpi_analysis/
+       └── hpi-analysis/
            ├── SKILL.md
            ├── README.md
            └── references/
@@ -34,7 +34,7 @@ To use this HPI analysis skill in a brand new project, follow these exact steps:
    ```
 
 5. **Start Codex**:
-   Open a terminal, navigate to your new project root folder, and run your Codex command. Codex will scan the `skills/` folder, automatically discover `skills/hpi_analysis/SKILL.md`, and load the skill rules.
+   Open a terminal, navigate to your new project root folder, and run your Codex command. Codex will scan the `skills/` folder, automatically discover `skills/hpi-analysis/SKILL.md`, and load the skill rules.
 
 6. **Let Codex Handle the REST**:
    When you send a prompt requesting HPI data analysis, Codex will automatically read the skill directives, initialize the local virtual environment (`venv`) if it does not exist, install the required packages (like `pandas` or `matplotlib`), run the dynamic code, and output the analysis.

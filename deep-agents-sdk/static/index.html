@@ -61,10 +61,18 @@
                     <strong id="project-title">No project selected</strong>
                     <span id="session-title">Select a project to begin</span>
                 </div>
-                <button class="icon-button" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 6 6 0 0 1-9-9Z"></path></svg>
-                </button>
+                <div class="workspace-actions">
+                    <div class="run-status hidden" id="run-status" role="status" aria-live="polite">
+                        <span class="status-dot"></span>
+                        <span id="run-status-text">Idle</span>
+                    </div>
+                    <button class="meta-button hidden" id="isolation-btn" type="button">Isolation</button>
+                    <button class="icon-button" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 6 6 0 0 1-9-9Z"></path></svg>
+                    </button>
+                </div>
             </header>
+            <div class="workspace-meta hidden" id="workspace-meta"></div>
 
             <section class="messages" id="chat-log">
                 <div class="empty-state" id="empty-state">
@@ -74,6 +82,7 @@
             </section>
 
             <footer class="composer">
+                <div class="artifact-strip hidden" id="artifact-strip"></div>
                 <div class="composer-box">
                     <textarea id="prompt-input" rows="1" placeholder="Select a project to start" disabled></textarea>
                     <button class="send-button" id="send-btn" title="Send" aria-label="Send" disabled>↑</button>
@@ -151,6 +160,21 @@
                 <button class="secondary-action" data-close-modal="settings-modal">Cancel</button>
                 <button class="primary-action" id="save-settings-btn">Save</button>
             </div>
+        </div>
+    </div>
+
+    <div class="modal-backdrop hidden" id="isolation-modal">
+        <div class="modal isolation-modal">
+            <div class="modal-header">
+                <div>
+                    <h2>Project Isolation</h2>
+                    <p id="isolation-subtitle"></p>
+                </div>
+                <button class="icon-button" data-close-modal="isolation-modal" aria-label="Close">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+                </button>
+            </div>
+            <div class="isolation-body" id="isolation-body"></div>
         </div>
     </div>
 

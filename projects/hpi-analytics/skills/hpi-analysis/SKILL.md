@@ -1,5 +1,5 @@
 ---
-name: hpi_analysis
+name: hpi-analysis
 description: Explore and analyze the Federal Housing Finance Agency (FHFA) House Price Index (HPI) data using Python, pandas, and matplotlib.
 ---
 
@@ -10,7 +10,7 @@ This skill guides you on how to explore, filter, analyze, and visualize the Fede
 ## Data Locations
 
 - **Master CSV**: `data/hpi_master.csv` (contains over 180,000 observations of HPI data from 1975 to 2026).
-- **Metadata Reference**: `skills/hpi_analysis/references/hpi_metadata.json` (describes columns, value types, and definitions).
+- **Metadata Reference**: `skills/hpi-analysis/references/hpi_metadata.json` (describes columns, value types, and definitions).
 - **Excel Dictionary**: `data/hpi_dictionary.xlsx` (original Excel schema source).
 
 ---
