@@ -19,3 +19,16 @@ Current the deep-agents-sdk implementation supports skills under skills/ folder.
 - To issue prompts, users must first select a project. Upon selection, the system must load all skills metadata of the selected project into the skills registry, as currently done in the current implementation. In other word, each project has its own skills registry. This is critical dynamic loading of skills per prompt for the selected project
 - For each project, users could have multiple chat sessions. Save each chat session so users can go back and view or continue where they left off
 - The above functionality is very similar to how the current OpenAI Codex app works, except that is our implementation, we allow users to upload contents of each project. Also the skills registry for each project must be dynamically loaded upon selection
+
+## Multi-user and storage requirements
+
+- CDX performs OIDC login/logout and cryptographically validates the JWT before overwriting the `x-fnma-jws-token` header. Every API request requires that header. The application decodes the trusted token and uses its `sub` claim in the fixed `cdx` identity namespace.
+- Projects, their data, and their skills are shared and readable by every authenticated user.
+- Sessions, prompts, task runs, checkpoints, and generated artifacts are private to their owning user.
+- Only a trusted CDX token whose `roles` claim contains `PROJECT_ADMIN` may create, rename, import, replace, clear, or delete projects or change global settings.
+- Session limits apply independently to each user and project.
+- Generated artifacts are served through ownership-checked API endpoints, never through a public static mount.
+- `DEEP_AGENTS_DB_DIR` controls the local directory containing SQLite databases and their WAL/SHM sidecars.
+- `DEEP_AGENTS_GENERATED_DIR` is the only generated-output root. It contains private temporary workspaces, upload previews, and retained artifacts under user/project/session/run ownership paths. `DEEP_AGENTS_RUN_ARTIFACT_DIR` is injected into generated Python for the active run and is not a configurable environment setting.
+- Generated Python executes from its private run workspace. Shared project `data/` is exposed there for reads; relative outputs are collected into the run artifact directory, and unexpected new files under the shared project are quarantined as private run artifacts.
+- Existing unowned runtime state is discarded during the multi-user cutover; shared project directories are rediscovered from `PROJECTS_DIR`.

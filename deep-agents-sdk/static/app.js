@@ -2,6 +2,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const state = {
         projects: [],
         sessions: [],
+        sessionsByProject: new Map(),
+        messagesBySession: new Map(),
+        expandedProjects: new Set(),
+        navigationRequestId: 0,
         currentProject: null,
         currentSession: null,
         upload: null,
@@ -10,16 +14,18 @@ document.addEventListener("DOMContentLoaded", () => {
         pendingProjectName: null,
         menuProjectId: null,
         settings: null,
-        isolationAudit: null,
+        currentUser: null,
+        developmentLoginEnabled: false,
         currentMessages: [],
-        runStatusTimer: null,
+        activeRuns: new Map(),
+        artifactObjectUrls: new Set(),
     };
 
     const els = {
         sidebar: document.getElementById("sidebar"),
+        appShell: document.querySelector(".app-shell"),
         sidebarCollapseBtn: document.getElementById("sidebar-collapse-btn"),
         projectList: document.getElementById("project-list"),
-        sessionList: document.getElementById("session-list"),
         addProjectBtn: document.getElementById("add-project-btn"),
         settingsBtn: document.getElementById("settings-btn"),
         settingsModal: document.getElementById("settings-modal"),
@@ -31,18 +37,11 @@ document.addEventListener("DOMContentLoaded", () => {
         projectTitle: document.getElementById("project-title"),
         sessionTitle: document.getElementById("session-title"),
         workspaceMeta: document.getElementById("workspace-meta"),
-        runStatus: document.getElementById("run-status"),
-        runStatusText: document.getElementById("run-status-text"),
-        isolationBtn: document.getElementById("isolation-btn"),
-        isolationModal: document.getElementById("isolation-modal"),
-        isolationSubtitle: document.getElementById("isolation-subtitle"),
-        isolationBody: document.getElementById("isolation-body"),
         chatLog: document.getElementById("chat-log"),
         emptyState: document.getElementById("empty-state"),
         promptInput: document.getElementById("prompt-input"),
         sendBtn: document.getElementById("send-btn"),
         composerHint: document.getElementById("composer-hint"),
-        artifactStrip: document.getElementById("artifact-strip"),
         contentModal: document.getElementById("content-modal"),
         contentSubtitle: document.getElementById("content-subtitle"),
         contentTree: document.getElementById("content-tree"),
@@ -55,6 +54,12 @@ document.addEventListener("DOMContentLoaded", () => {
         themeToggle: document.getElementById("theme-toggle"),
         mobileMenuBtn: document.getElementById("mobile-menu-btn"),
         mobileCloseBtn: document.getElementById("mobile-close-btn"),
+        developmentLoginModal: document.getElementById("development-login-modal"),
+        developmentLoginForm: document.getElementById("development-login-form"),
+        developmentSubject: document.getElementById("development-subject"),
+        developmentProjectAdmin: document.getElementById("development-project-admin"),
+        developmentLoginStatus: document.getElementById("development-login-status"),
+        developmentLoginSubmit: document.getElementById("development-login-submit"),
     };
 
     setupTheme();
@@ -64,11 +69,96 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function initializeApp() {
         try {
-            await loadSettings();
-        } catch (_) {
+            const authConfig = await loadAuthenticationConfig();
+            if (authConfig.development_login_enabled && !authConfig.cdx_header_present) {
+                showDevelopmentLogin(authConfig.development_identity);
+                return;
+            }
+            const authData = await loadIdentity();
+            await initializeAuthenticatedWorkspace(authData.user);
+        } catch (error) {
             state.settings = null;
+            state.currentUser = null;
+            showEmpty("Authentication required", error.message);
         }
+    }
+
+    async function initializeAuthenticatedWorkspace(user) {
+        state.currentUser = user;
+        applyAuthorizationUi();
+        await loadSettings();
         await loadProjects();
+    }
+
+    async function loadIdentity() {
+        return api("/api/auth/me");
+    }
+
+    async function loadAuthenticationConfig() {
+        const data = await api("/api/auth/config");
+        state.developmentLoginEnabled = Boolean(data.development_login_enabled);
+        return data;
+    }
+
+    function showDevelopmentLogin(identity = null) {
+        els.developmentLoginStatus.textContent = "";
+        if (identity) {
+            els.developmentSubject.value = identity.subject || "";
+            els.developmentProjectAdmin.checked = Boolean(identity.project_admin);
+        }
+        els.developmentLoginModal.classList.remove("hidden");
+        els.appShell.inert = true;
+        window.requestAnimationFrame(() => els.developmentSubject.focus());
+    }
+
+    function hideDevelopmentLogin() {
+        els.developmentLoginModal.classList.add("hidden");
+        els.appShell.inert = false;
+    }
+
+    async function submitDevelopmentLogin(event) {
+        event.preventDefault();
+        const subject = els.developmentSubject.value.trim();
+        if (!subject) {
+            els.developmentLoginStatus.textContent = "Enter a user subject to continue.";
+            els.developmentSubject.focus();
+            return;
+        }
+
+        els.developmentLoginSubmit.disabled = true;
+        els.developmentLoginForm.setAttribute("aria-busy", "true");
+        els.developmentLoginStatus.textContent = "Creating local identity…";
+        try {
+            const authData = await api("/api/auth/development-login", {
+                method: "POST",
+                body: JSON.stringify({
+                    subject,
+                    project_admin: els.developmentProjectAdmin.checked,
+                }),
+            });
+            hideDevelopmentLogin();
+            await initializeAuthenticatedWorkspace(authData.user);
+        } catch (error) {
+            els.developmentLoginStatus.textContent = error.message;
+        } finally {
+            els.developmentLoginSubmit.disabled = false;
+            els.developmentLoginForm.removeAttribute("aria-busy");
+        }
+    }
+
+    function isProjectAdmin() {
+        return Boolean(state.currentUser && state.currentUser.is_project_admin);
+    }
+
+    function applyAuthorizationUi() {
+        const admin = isProjectAdmin();
+        els.addProjectBtn.classList.toggle("hidden", !admin);
+        els.saveSettingsBtn.classList.toggle("hidden", !admin);
+        els.settingsDefaultModel.disabled = !admin;
+        els.settingsMaxSessions.disabled = !admin;
+        document.querySelectorAll('[data-project-action="upload"], [data-project-action="delete"]').forEach((button) => {
+            button.classList.toggle("hidden", !admin);
+        });
     }
 
     function setupTheme() {
@@ -97,11 +187,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
         els.addProjectBtn.addEventListener("click", createEmptyProject);
         els.settingsBtn.addEventListener("click", openSettings);
-        els.isolationBtn.addEventListener("click", openIsolationModal);
         els.saveSettingsBtn.addEventListener("click", saveSettings);
         els.sendBtn.addEventListener("click", sendMessage);
         els.confirmImportBtn.addEventListener("click", confirmImport);
         els.projectMenu.addEventListener("click", handleProjectMenuAction);
+        els.developmentLoginForm.addEventListener("submit", submitDevelopmentLogin);
 
         els.promptInput.addEventListener("input", () => {
             els.promptInput.style.height = "auto";
@@ -118,6 +208,15 @@ document.addEventListener("DOMContentLoaded", () => {
         els.zipFileInput.addEventListener("change", previewZip);
 
         document.addEventListener("click", (event) => {
+            const protectedLink = event.target.closest('a[href^="/api/artifacts/"]');
+            if (protectedLink) {
+                event.preventDefault();
+                downloadProtectedArtifact(
+                    protectedLink.href,
+                    protectedLink.dataset.artifactName || protectedLink.textContent.trim() || "artifact",
+                );
+                return;
+            }
             if (!els.projectMenu.contains(event.target) && !event.target.closest(".project-menu-btn")) {
                 closeProjectMenu();
             }
@@ -127,7 +226,6 @@ document.addEventListener("DOMContentLoaded", () => {
             if (event.key === "Escape") {
                 closeProjectMenu();
                 closeModal("settings-modal");
-                closeModal("isolation-modal");
             }
         });
 
@@ -136,11 +234,16 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    async function appFetch(path, options = {}) {
+        const headers = new Headers(options.headers || {});
+        if (!(options.body instanceof FormData) && options.body !== undefined && !headers.has("Content-Type")) {
+            headers.set("Content-Type", "application/json");
+        }
+        return fetch(path, { ...options, headers });
+    }
+
     async function api(path, options = {}) {
-        const response = await fetch(path, {
-            headers: options.body instanceof FormData ? undefined : { "Content-Type": "application/json" },
-            ...options,
-        });
+        const response = await appFetch(path, options);
         if (!response.ok) {
             let detail = `Request failed with ${response.status}`;
             try {
@@ -149,7 +252,9 @@ document.addEventListener("DOMContentLoaded", () => {
             } catch (_) {
                 // Keep default detail.
             }
-            throw new Error(detail);
+            const error = new Error(detail);
+            error.status = response.status;
+            throw error;
         }
         return response.json();
     }
@@ -158,11 +263,15 @@ document.addEventListener("DOMContentLoaded", () => {
         try {
             const data = await api("/api/projects");
             state.projects = data.projects || [];
+            await Promise.allSettled(
+                state.projects.map((project) => loadProjectSessions(project.id, false)),
+            );
             renderProjects();
 
             const preferredId = selectId || localStorage.getItem("currentProjectId");
             const project = state.projects.find((item) => item.id === preferredId) || state.projects[0];
             if (project) {
+                state.expandedProjects.add(project.id);
                 await selectProject(project.id);
             } else {
                 updateProjectState();
@@ -172,38 +281,49 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function selectProject(projectId) {
-        const projectData = await api(`/api/projects/${projectId}`);
-        state.currentProject = projectData.project;
+    async function selectProject(projectId, { expand = true } = {}) {
+        const project = state.projects.find((item) => item.id === projectId);
+        if (!project) return;
+        state.navigationRequestId += 1;
+        state.currentProject = project;
         state.currentSession = null;
         state.currentMessages = [];
-        state.isolationAudit = null;
+        state.sessions = state.sessionsByProject.get(projectId) || [];
+        if (expand) state.expandedProjects.add(projectId);
         localStorage.setItem("currentProjectId", projectId);
-        await loadProjectIsolation(projectId);
-        await loadSessions();
         updateProjectState();
         if (state.sessions.length) {
-            await selectSession(state.sessions[0].id);
+            await selectSession(state.sessions[0].id, projectId, { expand });
         } else {
-            showEmpty("What should we work on?", "Start a new chat in this project.");
+            showNewPrompt(projectId, { expand });
         }
         els.sidebar.classList.remove("open");
     }
 
     async function loadSessions() {
         if (!state.currentProject) return;
-        const data = await api(`/api/projects/${state.currentProject.id}/sessions`);
-        state.sessions = data.sessions || [];
-        renderSessions();
+        await loadProjectSessions(state.currentProject.id);
     }
 
-    async function loadProjectIsolation(projectId) {
-        try {
-            const data = await api(`/api/projects/${projectId}/isolation`);
-            state.isolationAudit = data.audit || null;
-        } catch (_) {
-            state.isolationAudit = null;
+    async function loadProjectSessions(projectId, shouldRender = true) {
+        const data = await api(`/api/projects/${projectId}/sessions`);
+        const sessions = data.sessions || [];
+        state.sessionsByProject.set(projectId, sessions);
+        sessions.forEach((session) => {
+            if (session.active_run_id) {
+                trackActiveRun({
+                    projectId,
+                    sessionId: session.id,
+                    runId: session.active_run_id,
+                    status: session.active_run_status || "Working…",
+                });
+            }
+        });
+        if (state.currentProject && state.currentProject.id === projectId) {
+            state.sessions = sessions;
         }
+        if (shouldRender) renderProjects();
+        return sessions;
     }
 
     function renderProjects() {
@@ -213,6 +333,11 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
         state.projects.forEach((project) => {
+            const group = document.createElement("div");
+            group.className = "project-group";
+            const expanded = state.expandedProjects.has(project.id);
+            group.classList.toggle("expanded", expanded);
+
             const row = document.createElement("div");
             row.className = "project-row";
             if (state.currentProject && state.currentProject.id === project.id) {
@@ -221,9 +346,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const selectButton = document.createElement("button");
             selectButton.className = "project-select";
-            selectButton.innerHTML = `${icon("folder")}<span class="item-label">${escapeHtml(project.name)}</span>`;
+            selectButton.innerHTML = `${icon(expanded ? "folderOpen" : "folder")}<span class="item-label">${escapeHtml(project.name)}</span>`;
             selectButton.title = project.name;
-            selectButton.addEventListener("click", () => selectProject(project.id));
+            selectButton.setAttribute("aria-expanded", expanded ? "true" : "false");
+            selectButton.addEventListener("click", () => toggleProject(project.id));
 
             const newChatButton = document.createElement("button");
             newChatButton.className = "icon-button row-action project-new-chat-btn";
@@ -249,30 +375,101 @@ document.addEventListener("DOMContentLoaded", () => {
             row.appendChild(selectButton);
             row.appendChild(newChatButton);
             row.appendChild(menuButton);
-            els.projectList.appendChild(row);
+            group.appendChild(row);
+
+            if (expanded) {
+                const prompts = document.createElement("div");
+                prompts.className = "project-prompts";
+                const sessions = state.sessionsByProject.get(project.id) || [];
+                if (!sessions.length) {
+                    const newPrompt = document.createElement("button");
+                    newPrompt.className = "list-item session-item new-prompt-item";
+                    if (state.currentProject && state.currentProject.id === project.id && !state.currentSession) {
+                        newPrompt.classList.add("active");
+                    }
+                    newPrompt.innerHTML = `<span class="item-label">New prompt</span>`;
+                    newPrompt.addEventListener("click", () => showNewPrompt(project.id));
+                    prompts.appendChild(newPrompt);
+                } else {
+                    sessions.forEach((session) => {
+                        const sessionRow = document.createElement("div");
+                        sessionRow.className = "session-row";
+                        const button = document.createElement("button");
+                        button.className = "list-item session-item";
+                        if (
+                            state.currentProject
+                            && state.currentProject.id === project.id
+                            && state.currentSession
+                            && state.currentSession.id === session.id
+                        ) {
+                            button.classList.add("active");
+                        }
+                        const activeRun = getActiveRun(project.id, session.id);
+                        button.innerHTML = `<span class="item-label">${escapeHtml(session.title)}</span>`;
+                        if (activeRun) {
+                            const indicator = document.createElement("span");
+                            indicator.className = "session-run-indicator";
+                            indicator.title = activeRun.status;
+                            indicator.setAttribute("aria-label", "Task running");
+                            button.appendChild(indicator);
+                        }
+                        button.addEventListener("click", () => selectSession(session.id, project.id));
+
+                        const deleteButton = document.createElement("button");
+                        deleteButton.type = "button";
+                        deleteButton.className = "session-delete-button";
+                        deleteButton.title = activeRun
+                            ? "This chat cannot be deleted while its task is running"
+                            : `Delete ${session.title}`;
+                        deleteButton.setAttribute("aria-label", `Delete chat ${session.title}`);
+                        deleteButton.innerHTML = icon("trash");
+                        deleteButton.disabled = Boolean(activeRun);
+                        deleteButton.addEventListener("click", (event) => {
+                            event.stopPropagation();
+                            deleteSession(project.id, session.id);
+                        });
+
+                        sessionRow.append(button, deleteButton);
+                        prompts.appendChild(sessionRow);
+                    });
+                }
+                group.appendChild(prompts);
+            }
+            els.projectList.appendChild(group);
         });
     }
 
     function renderSessions() {
-        els.sessionList.innerHTML = "";
-        if (!state.currentProject) {
-            els.sessionList.appendChild(emptyListItem("Select a project"));
+        renderProjects();
+    }
+
+    function toggleProject(projectId) {
+        if (state.expandedProjects.has(projectId)) {
+            state.expandedProjects.delete(projectId);
+        } else {
+            state.expandedProjects.add(projectId);
+        }
+        if (!state.currentProject || state.currentProject.id !== projectId) {
+            selectProject(projectId, { expand: false });
             return;
         }
-        if (!state.sessions.length) {
-            els.sessionList.appendChild(emptyListItem("No chats yet"));
-            return;
-        }
-        state.sessions.forEach((session) => {
-            const button = document.createElement("button");
-            button.className = "list-item session-item";
-            if (state.currentSession && state.currentSession.id === session.id) {
-                button.classList.add("active");
-            }
-            button.innerHTML = `<span class="item-label">${escapeHtml(session.title)}</span>`;
-            button.addEventListener("click", () => selectSession(session.id));
-            els.sessionList.appendChild(button);
-        });
+        renderProjects();
+    }
+
+    function showNewPrompt(projectId, { expand = true } = {}) {
+        const project = state.projects.find((item) => item.id === projectId);
+        if (!project) return;
+        state.navigationRequestId += 1;
+        state.currentProject = project;
+        state.currentSession = null;
+        state.currentMessages = [];
+        state.sessions = state.sessionsByProject.get(projectId) || [];
+        if (expand) state.expandedProjects.add(projectId);
+        localStorage.setItem("currentProjectId", projectId);
+        updateProjectState();
+        showEmpty("", "Ask this project to investigate something new.");
+        els.sidebar.classList.remove("open");
+        els.promptInput.focus();
     }
 
     function emptyListItem(text) {
@@ -284,18 +481,27 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function updateProjectState() {
         const hasProject = Boolean(state.currentProject);
+        const activeRun = currentActiveRun();
         els.projectTitle.textContent = hasProject ? state.currentProject.name : "No project selected";
-        els.sessionTitle.textContent = state.currentSession ? state.currentSession.title : hasProject ? "No chat selected" : "Select a project to begin";
-        els.promptInput.disabled = !hasProject;
-        els.sendBtn.disabled = !hasProject;
-        els.promptInput.placeholder = hasProject ? "Ask this project to investigate..." : "Select a project to start";
-        els.composerHint.textContent = hasProject ? `Using skills and data from ${state.currentProject.name}.` : "Prompts are scoped to the selected project.";
+        els.sessionTitle.textContent = state.currentSession ? state.currentSession.title : hasProject ? "New prompt" : "Select a project to begin";
+        els.promptInput.disabled = !hasProject || Boolean(activeRun);
+        els.sendBtn.disabled = !hasProject || Boolean(activeRun);
+        els.promptInput.placeholder = !hasProject
+            ? "Select a project to start"
+            : activeRun
+                ? "This chat has a task running…"
+                : "Ask this project to investigate...";
+        els.composerHint.textContent = activeRun
+            ? activeRun.status
+            : hasProject
+                ? `Using skills and data from ${state.currentProject.name}.`
+                : "Prompts are scoped to the selected project.";
         renderWorkspaceMeta();
         renderProjects();
-        renderSessions();
     }
 
     async function createEmptyProject() {
+        if (!isProjectAdmin()) return;
         const name = window.prompt("Project name");
         if (!name || !name.trim()) return;
         try {
@@ -310,6 +516,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function deleteProject(projectId) {
+        if (!isProjectAdmin()) return;
         const project = state.projects.find((item) => item.id === projectId);
         if (!project) return;
         const confirmed = window.confirm(`Delete "${project.name}" and its project folder from disk?`);
@@ -321,46 +528,123 @@ document.addEventListener("DOMContentLoaded", () => {
                 state.currentSession = null;
                 localStorage.removeItem("currentProjectId");
             }
+            state.sessionsByProject.delete(projectId);
+            state.expandedProjects.delete(projectId);
             await loadProjects();
         } catch (error) {
             window.alert(error.message);
         }
     }
 
-    async function createNewSession(projectId = null) {
+    function createNewSession(projectId = null) {
         const targetProjectId = projectId || (state.currentProject && state.currentProject.id);
         if (!targetProjectId) return;
+        showNewPrompt(targetProjectId);
+    }
+
+    async function deleteSession(projectId, sessionId) {
+        const sessions = state.sessionsByProject.get(projectId) || [];
+        const session = sessions.find((item) => item.id === sessionId);
+        if (!session) return;
+        if (getActiveRun(projectId, sessionId)) {
+            window.alert("This chat cannot be deleted while its task is running.");
+            return;
+        }
+        const confirmed = window.confirm(
+            `Delete "${session.title}"? This permanently removes the conversation and all generated outputs.`,
+        );
+        if (!confirmed) return;
+
         try {
-            const data = await api(`/api/projects/${targetProjectId}/sessions`, {
-                method: "POST",
-                body: JSON.stringify({ title: "New chat" }),
-            });
-            if (!state.currentProject || state.currentProject.id !== targetProjectId) {
-                const projectData = await api(`/api/projects/${targetProjectId}`);
-                state.currentProject = projectData.project;
+            await api(`/api/projects/${projectId}/sessions/${sessionId}`, { method: "DELETE" });
+            state.navigationRequestId += 1;
+            const remaining = sessions.filter((item) => item.id !== sessionId);
+            state.sessionsByProject.set(projectId, remaining);
+            state.messagesBySession.delete(activeRunKey(projectId, sessionId));
+
+            if (isCurrentSession(projectId, sessionId)) {
                 state.currentSession = null;
-                localStorage.setItem("currentProjectId", targetProjectId);
-            }
-            if (Array.isArray(data.sessions)) {
-                state.sessions = data.sessions;
-                renderSessions();
+                state.currentMessages = [];
+                state.sessions = remaining;
+                if (remaining.length) {
+                    await selectSession(remaining[0].id, projectId);
+                } else {
+                    showNewPrompt(projectId);
+                }
             } else {
-                await loadSessions();
+                if (state.currentProject && state.currentProject.id === projectId) {
+                    state.sessions = remaining;
+                }
+                renderProjects();
             }
-            await selectSession(data.session.id);
         } catch (error) {
             window.alert(error.message);
         }
     }
 
-    async function selectSession(sessionId) {
-        if (!state.currentProject) return;
-        const data = await api(`/api/projects/${state.currentProject.id}/sessions/${sessionId}`);
-        state.currentSession = data.session;
-        state.currentMessages = data.messages || [];
-        renderMessages(state.currentMessages);
+    async function selectSession(sessionId, projectId = null, { expand = true } = {}) {
+        const targetProjectId = projectId || (state.currentProject && state.currentProject.id);
+        const project = state.projects.find((item) => item.id === targetProjectId);
+        if (!project) return;
+        const sessions = state.sessionsByProject.get(targetProjectId) || [];
+        const cachedSession = sessions.find((session) => session.id === sessionId);
+        const requestId = ++state.navigationRequestId;
+        state.currentProject = project;
+        state.sessions = sessions;
+        state.currentSession = cachedSession || { id: sessionId, title: "Loading prompt…" };
+        const cacheKey = activeRunKey(targetProjectId, sessionId);
+        const cachedMessages = state.messagesBySession.get(cacheKey);
+        state.currentMessages = cachedMessages ? [...cachedMessages] : [];
+        if (expand) state.expandedProjects.add(targetProjectId);
+        localStorage.setItem("currentProjectId", targetProjectId);
         updateProjectState();
+        if (cachedMessages || getActiveRun(targetProjectId, sessionId)) {
+            renderMessages(state.currentMessages);
+        } else {
+            showEmpty("", "Retrieving this project conversation…");
+        }
         els.sidebar.classList.remove("open");
+
+        try {
+            const [data, runData] = await Promise.all([
+                api(`/api/projects/${targetProjectId}/sessions/${sessionId}`),
+                api(`/api/projects/${targetProjectId}/sessions/${sessionId}/runs`),
+            ]);
+            const running = (runData.runs || []).find((run) => run.status === "running");
+            if (running) {
+                trackActiveRun({
+                    projectId: targetProjectId,
+                    sessionId,
+                    runId: running.id,
+                    status: running.latest_status || "Working…",
+                });
+            } else if (getActiveRun(targetProjectId, sessionId)) {
+                removeActiveRun(targetProjectId, sessionId);
+            }
+            const refreshedSessions = (state.sessionsByProject.get(targetProjectId) || []).map((session) => (
+                session.id === sessionId ? { ...session, ...data.session } : session
+            ));
+            state.sessionsByProject.set(targetProjectId, refreshedSessions);
+            const messages = data.messages || [];
+            state.messagesBySession.set(cacheKey, [...messages]);
+            if (
+                requestId !== state.navigationRequestId
+                || !state.currentProject
+                || state.currentProject.id !== targetProjectId
+                || !state.currentSession
+                || state.currentSession.id !== sessionId
+            ) return;
+            state.currentSession = data.session;
+            state.sessions = refreshedSessions;
+            state.currentMessages = [...messages];
+            renderMessages(state.currentMessages);
+            updateProjectState();
+        } catch (error) {
+            if (requestId === state.navigationRequestId) {
+                showEmpty("Unable to load prompt", error.message);
+                updateProjectState();
+            }
+        }
     }
 
     async function openSettings() {
@@ -393,9 +677,11 @@ document.addEventListener("DOMContentLoaded", () => {
         });
         els.settingsMaxSessions.value = settings.max_sessions_per_project || 5;
         els.settingsStatus.textContent = "";
+        applyAuthorizationUi();
     }
 
     async function saveSettings() {
+        if (!isProjectAdmin()) return;
         const defaultModel = els.settingsDefaultModel.value;
         const maxSessions = Number.parseInt(els.settingsMaxSessions.value, 10);
         if (!defaultModel || !Number.isInteger(maxSessions) || maxSessions < 1) {
@@ -438,29 +724,38 @@ document.addEventListener("DOMContentLoaded", () => {
         if (state.sessions.length) {
             await selectSession(state.sessions[0].id);
         } else {
-            updateProjectState();
-            showEmpty("What should we work on?", "This project has no chats yet.");
+            showNewPrompt(state.currentProject.id);
         }
     }
 
     function renderMessages(messages) {
+        revokeArtifactObjectUrls();
         els.chatLog.innerHTML = "";
-        if (!messages.length) {
-            renderArtifacts([]);
+        if (!messages.length && !currentActiveRun()) {
             showEmpty("What should we work on?", "This chat is ready for the selected project.");
             return;
         }
-        messages.forEach((message) => appendMessage(message.role, message.content, false));
-        renderArtifactsFromDom();
+        messages.forEach((message) => appendMessage(message.role, message.content, false, {
+            durationSeconds: message.duration_seconds,
+            createdAt: message.created_at,
+        }));
+        hydrateProtectedMedia(els.chatLog);
+        renderCurrentActiveRun();
         scrollToBottom();
     }
 
     function showEmpty(title, subtitle) {
         els.chatLog.innerHTML = "";
-        renderArtifacts([]);
         const div = document.createElement("div");
         div.className = "empty-state";
-        div.innerHTML = `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(subtitle)}</p>`;
+        if (title) {
+            const heading = document.createElement("h1");
+            heading.textContent = title;
+            div.appendChild(heading);
+        }
+        const description = document.createElement("p");
+        description.textContent = subtitle;
+        div.appendChild(description);
         els.chatLog.appendChild(div);
     }
 
@@ -470,22 +765,13 @@ document.addEventListener("DOMContentLoaded", () => {
         if (settings.default_model) {
             chips.push({ label: "Model", value: settings.default_model });
         }
-        if (state.currentProject) {
-            const skillCount = Array.isArray(state.currentProject.skills) ? state.currentProject.skills.length : 0;
-            chips.push({ label: "Skills", value: String(skillCount) });
-            chips.push({ label: "Chats", value: `${state.sessions.length}/${settings.max_sessions_per_project || 5}` });
-        }
         if (state.currentSession) {
             chips.push({ label: "Session", value: shortId(state.currentSession.id) });
-        }
-        if (state.isolationAudit) {
-            chips.push({ label: "Isolation", value: state.isolationAudit.passed ? "Pass" : "Review", tone: state.isolationAudit.passed ? "ok" : "warn" });
         }
 
         els.workspaceMeta.innerHTML = "";
         if (!chips.length) {
             els.workspaceMeta.classList.add("hidden");
-            els.isolationBtn.classList.add("hidden");
             return;
         }
 
@@ -496,42 +782,11 @@ document.addEventListener("DOMContentLoaded", () => {
             els.workspaceMeta.appendChild(span);
         });
         els.workspaceMeta.classList.remove("hidden");
-        els.isolationBtn.classList.toggle("hidden", !state.isolationAudit);
-        els.isolationBtn.classList.toggle("ok", Boolean(state.isolationAudit && state.isolationAudit.passed));
-        els.isolationBtn.classList.toggle("warn", Boolean(state.isolationAudit && !state.isolationAudit.passed));
-    }
-
-    function openIsolationModal() {
-        if (!state.isolationAudit) return;
-        const audit = state.isolationAudit;
-        els.isolationSubtitle.textContent = `${audit.project_name} - ${audit.passed ? "Pass" : "Review"}`;
-        els.isolationBody.innerHTML = "";
-
-        const summary = document.createElement("div");
-        summary.className = "isolation-summary";
-        summary.innerHTML = `
-            <div><span>Project root</span><code>${escapeHtml(audit.project_root)}</code></div>
-            <div><span>Skills source</span><code>${escapeHtml((audit.skills_source || []).map((item) => item.join(": ")).join(", "))}</code></div>
-            <div><span>Checkpoint thread</span><code>${escapeHtml(audit.checkpointing.sample_thread_id)}</code></div>
-            <div><span>Artifact prefix</span><code>${escapeHtml(audit.artifacts.chart_url_prefix)}</code></div>
-        `;
-        els.isolationBody.appendChild(summary);
-
-        const checks = document.createElement("div");
-        checks.className = "isolation-checks";
-        Object.entries(audit.checks || {}).forEach(([name, passed]) => {
-            const row = document.createElement("div");
-            row.className = `isolation-check ${passed ? "ok" : "warn"}`;
-            row.innerHTML = `<span>${passed ? "OK" : "!"}</span><code>${escapeHtml(name)}</code>`;
-            checks.appendChild(row);
-        });
-        els.isolationBody.appendChild(checks);
-        openModal("isolation-modal");
     }
 
     async function sendMessage() {
         const text = els.promptInput.value.trim();
-        if (!text || !state.currentProject) return;
+        if (!text || !state.currentProject || currentActiveRun()) return;
 
         if (!state.currentSession) {
             const data = await api(`/api/projects/${state.currentProject.id}/sessions`, {
@@ -541,64 +796,105 @@ document.addEventListener("DOMContentLoaded", () => {
             state.currentSession = data.session;
             if (Array.isArray(data.sessions)) {
                 state.sessions = data.sessions;
+                state.sessionsByProject.set(state.currentProject.id, data.sessions);
                 renderSessions();
             }
         }
 
+        const projectId = state.currentProject.id;
+        const sessionId = state.currentSession.id;
+        setSessionTitleFromPrompt(projectId, sessionId, text);
+        const issuedAt = new Date().toISOString();
         els.promptInput.value = "";
         els.promptInput.style.height = "auto";
-        setInputDisabled(true);
-        setRunStatus("Starting agent run", "active");
         clearEmptyState();
-        appendMessage("user", text);
-        state.currentMessages.push({ role: "user", content: text });
-        const assistantMessage = appendStreamingMessage();
+        appendMessage("user", text, true, { createdAt: issuedAt });
+        state.currentMessages.push({ role: "user", content: text, created_at: issuedAt });
+        state.messagesBySession.set(
+            activeRunKey(projectId, sessionId),
+            [...state.currentMessages],
+        );
+        trackActiveRun({
+            projectId,
+            sessionId,
+            runId: null,
+            status: "Preparing the agent workspace…",
+        });
+        renderCurrentActiveRun();
+        updateProjectState();
 
         try {
-            await streamChatResponse(text, assistantMessage);
+            await streamChatResponse(text, projectId, sessionId);
         } catch (error) {
             if (error.noFallback) {
-                setRunStatus("Run failed", "error");
-                await loadSessions();
-                updateProjectState();
+                removeActiveRun(projectId, sessionId);
+                await refreshSessionAfterRun(projectId, sessionId);
             } else {
-                assistantMessage.remove();
+                removeActiveRun(projectId, sessionId);
                 try {
-                    await sendMessageFallback(text);
+                    await sendMessageFallback(text, projectId, sessionId);
                 } catch (fallbackError) {
-                    appendMessage("assistant", `**System Error:** ${fallbackError.message}`).classList.add("error");
-                    setRunStatus("Run failed", "error");
+                    removeActiveRun(projectId, sessionId);
+                    if (isCurrentSession(projectId, sessionId)) {
+                        appendMessage("assistant", `**System Error:** ${fallbackError.message}`).classList.add("error");
+                    }
                 }
             }
         } finally {
-            setInputDisabled(false);
-            els.promptInput.focus();
+            if (isCurrentSession(projectId, sessionId)) {
+                updateProjectState();
+                els.promptInput.focus();
+            } else {
+                renderProjects();
+            }
         }
     }
 
-    async function sendMessageFallback(text) {
+    function setSessionTitleFromPrompt(projectId, sessionId, prompt) {
+        const normalized = prompt.trim().replace(/\s+/g, " ");
+        const title = normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}...` : normalized;
+        const sessions = (state.sessionsByProject.get(projectId) || []).map((session) => (
+            session.id === sessionId && session.title === "New chat"
+                ? { ...session, title }
+                : session
+        ));
+        state.sessionsByProject.set(projectId, sessions);
+        if (state.currentProject && state.currentProject.id === projectId) {
+            state.sessions = sessions;
+            if (state.currentSession && state.currentSession.id === sessionId && state.currentSession.title === "New chat") {
+                state.currentSession = { ...state.currentSession, title };
+            }
+        }
+        renderProjects();
+    }
+
+    async function sendMessageFallback(text, projectId, sessionId) {
+        trackActiveRun({
+            projectId,
+            sessionId,
+            runId: null,
+            status: "Working on the request…",
+        });
+        renderCurrentActiveRun();
         const data = await api("/api/chat", {
             method: "POST",
             body: JSON.stringify({
-                project_id: state.currentProject.id,
-                session_id: state.currentSession.id,
+                project_id: projectId,
+                session_id: sessionId,
                 message: text,
             }),
         });
-        appendMessage("assistant", data.response);
-        state.currentMessages.push({ role: "assistant", content: data.response });
-        renderArtifactsFromDom();
-        setRunStatus("Complete", "done", true);
-        await syncSessionAfterChat(data.session_id);
+        removeActiveRun(projectId, sessionId);
+        await refreshSessionAfterRun(projectId, data.session_id);
     }
 
-    async function streamChatResponse(text, assistantMessage) {
-        const response = await fetch("/api/chat/stream", {
+    async function streamChatResponse(text, projectId, sessionId) {
+        const response = await appFetch("/api/chat/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                project_id: state.currentProject.id,
-                session_id: state.currentSession.id,
+                project_id: projectId,
+                session_id: sessionId,
                 message: text,
             }),
         });
@@ -623,24 +919,32 @@ document.addEventListener("DOMContentLoaded", () => {
                 const event = parseStreamEvent(rawEvent);
                 if (!event) continue;
                 hasStreamEvent = true;
-                if (event.type === "status" && !streamedText) {
-                    setRunStatus(event.data.message || "Working", "active");
+                if (event.type === "run") {
+                    trackActiveRun({
+                        projectId,
+                        sessionId,
+                        runId: event.data.run_id,
+                        status: event.data.status || "Working…",
+                        streamConnected: true,
+                    });
+                } else if (event.type === "status" && !streamedText) {
+                    updateActiveRunStatus(
+                        projectId,
+                        sessionId,
+                        event.data.message || "Working…",
+                        event.data.run_id,
+                    );
                 } else if (event.type === "delta") {
-                    setRunStatus("Receiving response", "active");
                     streamedText += event.data.text || "";
-                    updateStreamingMessage(assistantMessage, streamedText || "_Working..._");
+                    const messageEl = activeRunMessage(projectId, sessionId);
+                    if (messageEl) updateStreamingMessage(messageEl, streamedText || "_Working..._");
                 } else if (event.type === "final") {
                     finalData = event.data;
-                    assistantMessage.classList.remove("streaming");
-                    updateStreamingMessage(assistantMessage, finalData.response || streamedText);
-                    state.currentMessages.push({ role: "assistant", content: finalData.response || streamedText });
-                    renderArtifactsFromDom();
-                    setRunStatus("Complete", "done", true);
+                    removeActiveRun(projectId, sessionId);
+                    await refreshSessionAfterRun(projectId, sessionId);
                 } else if (event.type === "error") {
-                    assistantMessage.classList.remove("streaming");
-                    assistantMessage.classList.add("error");
-                    updateStreamingMessage(assistantMessage, `**System Error:** ${event.data.message || "Streaming request failed"}`);
-                    setRunStatus("Run failed", "error");
+                    removeActiveRun(projectId, sessionId);
+                    await refreshSessionAfterRun(projectId, sessionId);
                     const streamError = new Error(event.data.message || "Streaming request failed");
                     streamError.noFallback = true;
                     throw streamError;
@@ -653,7 +957,6 @@ document.addEventListener("DOMContentLoaded", () => {
             streamError.noFallback = hasStreamEvent;
             throw streamError;
         }
-        await syncSessionAfterChat(finalData.session_id);
     }
 
     function parseStreamEvent(rawEvent) {
@@ -675,74 +978,155 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function syncSessionAfterChat(sessionId) {
-        await loadSessions();
-        const latest = state.sessions.find((session) => session.id === sessionId);
-        if (latest) state.currentSession = latest;
-        updateProjectState();
+    function activeRunKey(projectId, sessionId) {
+        return `${projectId}:${sessionId}`;
     }
 
-    function setRunStatus(text, tone = "active", autoHide = false) {
-        if (state.runStatusTimer) {
-            window.clearTimeout(state.runStatusTimer);
-            state.runStatusTimer = null;
+    function isCurrentSession(projectId, sessionId) {
+        return Boolean(
+            state.currentProject
+            && state.currentProject.id === projectId
+            && state.currentSession
+            && state.currentSession.id === sessionId
+        );
+    }
+
+    function getActiveRun(projectId, sessionId) {
+        if (!projectId || !sessionId) return null;
+        return state.activeRuns.get(activeRunKey(projectId, sessionId)) || null;
+    }
+
+    function currentActiveRun() {
+        if (!state.currentProject || !state.currentSession) return null;
+        return getActiveRun(state.currentProject.id, state.currentSession.id);
+    }
+
+    function trackActiveRun({ projectId, sessionId, runId, status, streamConnected = false }) {
+        const key = activeRunKey(projectId, sessionId);
+        const existing = state.activeRuns.get(key);
+        const run = existing || {
+            projectId,
+            sessionId,
+            runId: null,
+            status: "Working…",
+            pollTimer: null,
+            streamConnected: false,
+        };
+        if (runId) run.runId = runId;
+        if (status) run.status = status;
+        if (streamConnected) {
+            run.streamConnected = true;
+            if (run.pollTimer) window.clearTimeout(run.pollTimer);
+            run.pollTimer = null;
         }
-        els.runStatusText.textContent = text;
-        els.runStatus.className = `run-status ${tone}`;
-        if (autoHide) {
-            state.runStatusTimer = window.setTimeout(() => {
-                els.runStatus.classList.add("hidden");
-                state.runStatusTimer = null;
-            }, 2400);
+        state.activeRuns.set(key, run);
+        if (run.runId && !run.streamConnected) scheduleRunPoll(run);
+        if (isCurrentSession(projectId, sessionId)) {
+            renderCurrentActiveRun();
+            els.composerHint.textContent = run.status;
+            els.promptInput.disabled = true;
+            els.sendBtn.disabled = true;
+        }
+        renderSessions();
+        return run;
+    }
+
+    function updateActiveRunStatus(projectId, sessionId, status, runId = null) {
+        const run = trackActiveRun({ projectId, sessionId, runId, status });
+        const messageEl = activeRunMessage(projectId, sessionId);
+        if (messageEl) updateStreamingStatus(messageEl, run.status);
+    }
+
+    function activeRunMessage(projectId, sessionId) {
+        const key = activeRunKey(projectId, sessionId);
+        return Array.from(els.chatLog.querySelectorAll(".message.streaming"))
+            .find((message) => message.dataset.runKey === key) || null;
+    }
+
+    function renderCurrentActiveRun() {
+        const run = currentActiveRun();
+        if (!run) return;
+        clearEmptyState();
+        let messageEl = activeRunMessage(run.projectId, run.sessionId);
+        if (!messageEl) {
+            messageEl = appendStreamingMessage(run.status);
+            messageEl.dataset.runKey = activeRunKey(run.projectId, run.sessionId);
+            if (run.runId) messageEl.dataset.runId = run.runId;
+        } else {
+            updateStreamingStatus(messageEl, run.status);
         }
     }
 
-    function renderArtifactsFromDom() {
-        const artifacts = [];
-        els.chatLog.querySelectorAll(".message.assistant img, .message.assistant video, .message.assistant audio").forEach((node) => {
-            const src = node.getAttribute("src");
-            if (!src || artifacts.some((artifact) => artifact.src === src)) return;
-            artifacts.push({
-                src,
-                type: node.tagName.toLowerCase(),
-                label: node.getAttribute("alt") || src.split("/").pop() || "Artifact",
-            });
-        });
-        renderArtifacts(artifacts);
+    function scheduleRunPoll(run, delay = 1500) {
+        if (!run.runId || run.pollTimer) return;
+        run.pollTimer = window.setTimeout(() => pollActiveRun(run), delay);
     }
 
-    function renderArtifacts(artifacts) {
-        els.artifactStrip.innerHTML = "";
-        if (!artifacts.length) {
-            els.artifactStrip.classList.add("hidden");
-            return;
-        }
-
-        const label = document.createElement("span");
-        label.className = "artifact-label";
-        label.textContent = "Artifacts";
-        els.artifactStrip.appendChild(label);
-
-        artifacts.forEach((artifact, index) => {
-            const link = document.createElement("a");
-            link.className = "artifact-item";
-            link.href = artifact.src;
-            link.target = "_blank";
-            link.rel = "noreferrer";
-            link.title = artifact.label;
-            if (artifact.type === "img") {
-                link.innerHTML = `<img src="${escapeHtml(artifact.src)}" alt="${escapeHtml(artifact.label)}"><span>${escapeHtml(artifact.label)}</span>`;
-            } else {
-                link.innerHTML = `<span class="artifact-file">${index + 1}</span><span>${escapeHtml(artifact.label)}</span>`;
+    async function pollActiveRun(run) {
+        run.pollTimer = null;
+        if (state.activeRuns.get(activeRunKey(run.projectId, run.sessionId)) !== run) return;
+        try {
+            const data = await api(`/api/projects/${run.projectId}/sessions/${run.sessionId}/runs`);
+            const latest = (data.runs || []).find((item) => item.id === run.runId)
+                || (data.runs || []).find((item) => item.status === "running");
+            if (latest && latest.status === "running") {
+                updateActiveRunStatus(
+                    run.projectId,
+                    run.sessionId,
+                    latest.latest_status || run.status,
+                    latest.id,
+                );
+                scheduleRunPoll(run);
+                return;
             }
-            els.artifactStrip.appendChild(link);
-        });
-        els.artifactStrip.classList.remove("hidden");
+            removeActiveRun(run.projectId, run.sessionId);
+            await refreshSessionAfterRun(run.projectId, run.sessionId);
+        } catch (_) {
+            scheduleRunPoll(run, 3000);
+        }
     }
 
-    function setInputDisabled(disabled) {
-        els.promptInput.disabled = disabled || !state.currentProject;
-        els.sendBtn.disabled = disabled || !state.currentProject;
+    function removeActiveRun(projectId, sessionId) {
+        const key = activeRunKey(projectId, sessionId);
+        const run = state.activeRuns.get(key);
+        if (run && run.pollTimer) window.clearTimeout(run.pollTimer);
+        state.activeRuns.delete(key);
+        const messageEl = activeRunMessage(projectId, sessionId);
+        if (messageEl) messageEl.remove();
+        if (isCurrentSession(projectId, sessionId)) updateProjectState();
+        else renderSessions();
+    }
+
+    async function refreshSessionAfterRun(projectId, sessionId) {
+        try {
+            const [sessions, data] = await Promise.all([
+                loadProjectSessions(projectId, false),
+                api(`/api/projects/${projectId}/sessions/${sessionId}`),
+            ]);
+            const cacheKey = activeRunKey(projectId, sessionId);
+            const messages = data.messages || [];
+            state.messagesBySession.set(cacheKey, [...messages]);
+            state.sessionsByProject.set(projectId, sessions);
+
+            if (!isCurrentSession(projectId, sessionId)) {
+                renderProjects();
+                return;
+            }
+            state.sessions = sessions;
+            state.currentSession = data.session;
+            state.currentMessages = [...messages];
+            renderMessages(state.currentMessages);
+            updateProjectState();
+        } catch (error) {
+            if (error.status === 404) {
+                state.messagesBySession.delete(activeRunKey(projectId, sessionId));
+                return;
+            }
+            if (isCurrentSession(projectId, sessionId)) {
+                showEmpty("Unable to refresh prompt", error.message);
+                updateProjectState();
+            }
+        }
     }
 
     function clearEmptyState() {
@@ -751,40 +1135,300 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    function appendMessage(role, text, shouldScroll = true) {
+    function appendMessage(role, text, shouldScroll = true, metadata = {}) {
         clearEmptyState();
         const div = document.createElement("article");
         div.className = `message ${role}`;
-        const avatar = document.createElement("div");
-        avatar.className = "avatar";
-        avatar.textContent = role === "user" ? "U" : "A";
+        const body = document.createElement("div");
+        body.className = "message-body";
         const content = document.createElement("div");
         content.className = "message-content";
         content.innerHTML = parseMarkdown(text);
-        div.appendChild(avatar);
-        div.appendChild(content);
+        enhanceGeneratedArtifacts(content);
+        body.appendChild(content);
+        div.appendChild(body);
         els.chatLog.appendChild(div);
+        if (role === "user") {
+            appendPromptFooter(div, metadata.createdAt);
+        } else if (role === "assistant") {
+            appendResponseFooter(div, metadata.durationSeconds);
+        }
+        hydrateProtectedMedia(div);
         if (shouldScroll) scrollToBottom();
         return div;
     }
 
-    function appendStreamingMessage() {
-        const div = appendMessage("assistant", "_Starting..._");
+    function appendStreamingMessage(status) {
+        const div = appendMessage("assistant", "");
         div.classList.add("streaming");
+        updateStreamingStatus(div, status);
         return div;
+    }
+
+    function updateStreamingStatus(messageEl, status) {
+        const content = messageEl.querySelector(".message-content");
+        if (!content) return;
+        content.innerHTML = "";
+        const activity = document.createElement("div");
+        activity.className = "agent-activity";
+        activity.setAttribute("role", "status");
+        activity.setAttribute("aria-live", "polite");
+        const indicator = document.createElement("span");
+        indicator.className = "agent-activity-indicator";
+        indicator.innerHTML = "<span></span><span></span><span></span>";
+        const label = document.createElement("span");
+        label.textContent = status;
+        activity.append(indicator, label);
+        content.appendChild(activity);
+        scrollToBottom();
     }
 
     function updateStreamingMessage(messageEl, text) {
         const content = messageEl.querySelector(".message-content");
         if (!content) return;
         content.innerHTML = parseMarkdown(text);
+        enhanceGeneratedArtifacts(content);
+        hydrateProtectedMedia(content);
         scrollToBottom();
+    }
+
+    function appendResponseFooter(messageEl, durationSeconds) {
+        const body = messageEl.querySelector(".message-body");
+        const content = messageEl.querySelector(".message-content");
+        if (!body || !content || !content.textContent.trim()) return;
+        const existing = body.querySelector(".response-footer");
+        if (existing) existing.remove();
+
+        const footer = document.createElement("div");
+        footer.className = "response-footer";
+        const seconds = Number(durationSeconds);
+        if (durationSeconds !== null && durationSeconds !== undefined && Number.isFinite(seconds) && seconds >= 0) {
+            const duration = document.createElement("span");
+            duration.className = "response-duration";
+            duration.textContent = `Answered in ${formatDuration(seconds)}`;
+            footer.appendChild(duration);
+        }
+
+        footer.appendChild(createCopyButton(messageEl, "Copy response"));
+        body.appendChild(footer);
+    }
+
+    function appendPromptFooter(messageEl, createdAt) {
+        const body = messageEl.querySelector(".message-body");
+        const content = messageEl.querySelector(".message-content");
+        if (!body || !content || !content.textContent.trim()) return;
+
+        const footer = document.createElement("div");
+        footer.className = "prompt-footer";
+        const formatted = formatMessageDateTime(createdAt);
+        if (formatted) {
+            const timestamp = document.createElement("time");
+            timestamp.className = "prompt-timestamp";
+            timestamp.dateTime = new Date(createdAt).toISOString();
+            timestamp.textContent = formatted;
+            footer.appendChild(timestamp);
+        }
+        footer.appendChild(createCopyButton(messageEl, "Copy prompt"));
+        body.appendChild(footer);
+    }
+
+    function createCopyButton(messageEl, label) {
+        const copyButton = document.createElement("button");
+        copyButton.type = "button";
+        copyButton.className = "copy-message-button";
+        copyButton.title = label;
+        copyButton.dataset.copyLabel = label;
+        copyButton.setAttribute("aria-label", label);
+        copyButton.innerHTML = copyResponseIcon();
+        copyButton.addEventListener("click", () => copyResponse(messageEl, copyButton));
+        return copyButton;
+    }
+
+    function copyResponseIcon() {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>';
+    }
+
+    function copiedResponseIcon() {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>';
+    }
+
+    async function copyResponse(messageEl, button) {
+        const content = messageEl.querySelector(".message-content");
+        const text = content ? content.innerText.trim() : "";
+        if (!text) return;
+        button.classList.remove("copy-error");
+        try {
+            let copied = false;
+            if (navigator.clipboard && window.isSecureContext) {
+                try {
+                    await Promise.race([
+                        navigator.clipboard.writeText(text),
+                        new Promise((_, reject) => window.setTimeout(
+                            () => reject(new Error("Clipboard write timed out")),
+                            1000,
+                        )),
+                    ]);
+                    copied = true;
+                } catch (_) {
+                    copied = false;
+                }
+            }
+            if (!copied) {
+                const helper = document.createElement("textarea");
+                helper.className = "copy-helper";
+                helper.value = text;
+                helper.setAttribute("readonly", "");
+                document.body.appendChild(helper);
+                helper.select();
+                copied = document.execCommand("copy");
+                helper.remove();
+            }
+            if (!copied) throw new Error("Copy command failed");
+            button.classList.add("copied");
+            button.title = "Copied";
+            button.setAttribute("aria-label", "Copied");
+            button.innerHTML = copiedResponseIcon();
+            window.setTimeout(() => {
+                button.classList.remove("copied");
+                const label = button.dataset.copyLabel || "Copy";
+                button.title = label;
+                button.setAttribute("aria-label", label);
+                button.innerHTML = copyResponseIcon();
+            }, 5000);
+        } catch (_) {
+            button.classList.add("copy-error");
+            button.title = "Unable to copy";
+            button.setAttribute("aria-label", "Unable to copy response");
+        }
+    }
+
+    function formatDuration(seconds) {
+        if (seconds < 1) return "less than a second";
+        const totalSeconds = Math.round(seconds);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const remainder = totalSeconds % 60;
+        if (hours) return `${hours}h ${minutes}m ${remainder}s`;
+        if (minutes) return `${minutes}m ${remainder}s`;
+        return `${remainder}s`;
+    }
+
+    function formatMessageDateTime(value) {
+        if (!value) return "";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "";
+        return new Intl.DateTimeFormat(undefined, {
+            year: "numeric",
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+        }).format(date);
+    }
+
+    function enhanceGeneratedArtifacts(container) {
+        container.querySelectorAll("pre").forEach((block) => {
+            if (!block.textContent.trim()) block.remove();
+        });
+        const headings = Array.from(container.querySelectorAll("h3"))
+            .filter((heading) => heading.textContent.trim().toLowerCase() === "generated artifacts");
+
+        headings.forEach((heading) => {
+            heading.className = "generated-artifacts-title";
+            const grid = document.createElement("div");
+            grid.className = "generated-artifacts-grid";
+            let node = heading.nextElementSibling;
+
+            while (node && !node.matches("h1, h2, h3")) {
+                const next = node.nextElementSibling;
+                const onlyChild = node.tagName === "P" && node.children.length === 1
+                    ? node.firstElementChild
+                    : null;
+
+                if (onlyChild && onlyChild.matches('a[href^="/api/artifacts/"]')) {
+                    grid.appendChild(createArtifactFileCard(onlyChild));
+                    node.remove();
+                } else if (onlyChild && onlyChild.matches('img[src^="/api/artifacts/"]')) {
+                    grid.appendChild(createArtifactImageCard(onlyChild));
+                    node.remove();
+                }
+                node = next;
+            }
+
+            if (grid.children.length) {
+                heading.insertAdjacentElement("afterend", grid);
+            }
+        });
+    }
+
+    function createArtifactFileCard(sourceLink) {
+        const name = sourceLink.textContent.trim() || "Generated file";
+        const card = document.createElement("a");
+        card.className = "generated-artifact-card";
+        card.href = sourceLink.getAttribute("href");
+        card.title = `Download ${name}`;
+        card.dataset.artifactName = name;
+
+        const icon = document.createElement("span");
+        icon.className = "generated-artifact-icon";
+        icon.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l4 4v14H7z"></path><path d="M14 3v5h5"></path><path d="M9.5 14.5h6"></path><path d="M9.5 17.5h4"></path></svg>';
+
+        const details = document.createElement("span");
+        details.className = "generated-artifact-details";
+        const title = document.createElement("strong");
+        title.textContent = name;
+        const type = document.createElement("small");
+        type.textContent = `${artifactTypeLabel(name)} · Download`;
+        details.append(title, type);
+
+        const action = document.createElement("span");
+        action.className = "generated-artifact-action";
+        action.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11"></path><path d="m8 11 4 4 4-4"></path><path d="M5 20h14"></path></svg>';
+        card.append(icon, details, action);
+        return card;
+    }
+
+    function createArtifactImageCard(image) {
+        const source = image.getAttribute("src");
+        const name = image.getAttribute("alt") || "Generated image";
+        const card = document.createElement("a");
+        card.className = "generated-artifact-image";
+        card.href = source;
+        card.title = `Download ${name}`;
+        card.dataset.artifactName = name;
+        card.appendChild(image);
+        const footer = document.createElement("span");
+        footer.className = "generated-artifact-image-footer";
+        const label = document.createElement("strong");
+        label.textContent = name;
+        const action = document.createElement("span");
+        action.textContent = "Download image";
+        footer.append(label, action);
+        card.appendChild(footer);
+        return card;
+    }
+
+    function artifactTypeLabel(name) {
+        const extension = name.includes(".") ? name.split(".").pop().toUpperCase() : "FILE";
+        const labels = {
+            CSV: "CSV data",
+            JSON: "JSON data",
+            XLSX: "Excel workbook",
+            XLS: "Excel workbook",
+            PDF: "PDF document",
+            PNG: "PNG image",
+            JPG: "JPEG image",
+            JPEG: "JPEG image",
+            SVG: "SVG image",
+            TXT: "Text file",
+        };
+        return labels[extension] || `${extension} file`;
     }
 
     function appendTyping() {
         const div = document.createElement("article");
         div.className = "message assistant";
-        div.innerHTML = `<div class="avatar">A</div><div class="message-content"><div class="typing"><span></span><span></span><span></span></div></div>`;
+        div.innerHTML = `<div class="message-body"><div class="message-content"><div class="typing"><span></span><span></span><span></span></div></div></div>`;
         els.chatLog.appendChild(div);
         scrollToBottom();
         return div;
@@ -809,6 +1453,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function startZipFlow(target, projectId = null) {
+        if (!isProjectAdmin()) return;
         if (target === "content" && !projectId && !state.currentProject) return;
         state.uploadTarget = target;
         state.uploadProjectId = projectId || (state.currentProject && state.currentProject.id);
@@ -879,6 +1524,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function openProjectMenu(projectId, anchor) {
         state.menuProjectId = projectId;
+        applyAuthorizationUi();
         const rect = anchor.getBoundingClientRect();
         els.projectMenu.classList.remove("hidden");
         const menuRect = els.projectMenu.getBoundingClientRect();
@@ -1019,10 +1665,60 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function parseMarkdown(text) {
+        let rendered;
         if (window.marked && window.marked.parse) {
-            return window.marked.parse(text);
+            rendered = window.marked.parse(text);
+        } else {
+            rendered = escapeHtml(text).replace(/\n/g, "<br>");
         }
-        return escapeHtml(text).replace(/\n/g, "<br>");
+        if (!window.DOMPurify) {
+            return escapeHtml(text).replace(/\n/g, "<br>");
+        }
+        return window.DOMPurify.sanitize(rendered, {
+            USE_PROFILES: { html: true },
+            FORBID_TAGS: ["style", "iframe", "object", "embed", "form", "input", "button"],
+            FORBID_ATTR: ["style", "srcdoc"],
+        });
+    }
+
+    async function hydrateProtectedMedia(container) {
+        const nodes = container.querySelectorAll('img[src^="/api/"], video[src^="/api/"], audio[src^="/api/"]');
+        await Promise.all(Array.from(nodes).map(async (node) => {
+            const source = node.getAttribute("src");
+            if (!source || node.dataset.authLoaded === "true") return;
+            node.dataset.authLoaded = "true";
+            try {
+                const response = await appFetch(source);
+                if (!response.ok) throw new Error(`Artifact request failed with ${response.status}`);
+                const objectUrl = URL.createObjectURL(await response.blob());
+                state.artifactObjectUrls.add(objectUrl);
+                node.src = objectUrl;
+                node.dataset.originalSrc = source;
+            } catch (_) {
+                node.dataset.authLoaded = "error";
+                node.alt = "Private artifact unavailable";
+            }
+        }));
+    }
+
+    async function downloadProtectedArtifact(url, fallbackName) {
+        try {
+            const response = await appFetch(url);
+            if (!response.ok) throw new Error(`Download failed with ${response.status}`);
+            const blobUrl = URL.createObjectURL(await response.blob());
+            const link = document.createElement("a");
+            link.href = blobUrl;
+            link.download = fallbackName;
+            link.click();
+            URL.revokeObjectURL(blobUrl);
+        } catch (error) {
+            window.alert(error.message);
+        }
+    }
+
+    function revokeArtifactObjectUrls() {
+        state.artifactObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+        state.artifactObjectUrls.clear();
     }
 
     function escapeHtml(value) {
@@ -1054,7 +1750,9 @@ document.addEventListener("DOMContentLoaded", () => {
     function icon(name) {
         const icons = {
             folder: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5Z"></path></svg>',
+            folderOpen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9V7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5V10"></path><path d="M4 10h17l-2 8.5a2 2 0 0 1-2 1.5H5.5a2 2 0 0 1-2-2.4Z"></path></svg>',
             edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3H6a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-6"></path><path d="M18.5 2.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4Z"></path></svg>',
+            trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M6 7l1 14h10l1-14"></path><path d="M9 7V4h6v3"></path></svg>',
             more: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01"></path><path d="M12 12h.01"></path><path d="M19 12h.01"></path></svg>',
         };
         return icons[name] || "";

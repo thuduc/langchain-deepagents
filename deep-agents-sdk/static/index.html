@@ -9,9 +9,10 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
-    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css" integrity="sha384-GvrOXuhMATgEsSwCs4smul74iXGOixntILdUW9XmUC6+HX0sLNAK3q71HotJqlAn" crossorigin="anonymous">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js" integrity="sha384-cpW21h6RZv/phavutF+AuVYrr+dA8xD9zs6FwLpaCct6O9ctzYFfFr4dgmgccOTx" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js" integrity="sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js" integrity="sha384-JEyTNhjM6R1ElGoJns4U2Ln4ofPcqzSsynQkmEc/KGy6336qAZl70tDLufbkla+3" crossorigin="anonymous"></script>
 </head>
 <body>
     <div class="app-shell">
@@ -25,7 +26,7 @@
                 </button>
             </div>
 
-            <section class="nav-section">
+            <section class="nav-section projects-section">
                 <div class="section-header">
                     <span>Projects</span>
                     <div class="section-actions">
@@ -35,13 +36,6 @@
                     </div>
                 </div>
                 <div class="list" id="project-list"></div>
-            </section>
-
-            <section class="nav-section sessions-section">
-                <div class="section-header">
-                    <span>Chats</span>
-                </div>
-                <div class="list" id="session-list"></div>
             </section>
 
             <footer class="sidebar-footer">
@@ -62,11 +56,6 @@
                     <span id="session-title">Select a project to begin</span>
                 </div>
                 <div class="workspace-actions">
-                    <div class="run-status hidden" id="run-status" role="status" aria-live="polite">
-                        <span class="status-dot"></span>
-                        <span id="run-status-text">Idle</span>
-                    </div>
-                    <button class="meta-button hidden" id="isolation-btn" type="button">Isolation</button>
                     <button class="icon-button" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
                         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 6 6 0 0 1-9-9Z"></path></svg>
                     </button>
@@ -82,7 +71,6 @@
             </section>
 
             <footer class="composer">
-                <div class="artifact-strip hidden" id="artifact-strip"></div>
                 <div class="composer-box">
                     <textarea id="prompt-input" rows="1" placeholder="Select a project to start" disabled></textarea>
                     <button class="send-button" id="send-btn" title="Send" aria-label="Send" disabled>↑</button>
@@ -90,6 +78,41 @@
                 <div class="hint" id="composer-hint">Prompts are scoped to the selected project.</div>
             </footer>
         </main>
+    </div>
+
+    <div class="modal-backdrop hidden" id="development-login-modal">
+        <div class="modal development-login-modal" role="dialog" aria-modal="true" aria-labelledby="development-login-title" aria-describedby="development-login-description">
+            <div class="development-login-intro">
+                <div class="development-login-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.4 7 10 4.2-1.6 7-5.4 7-10V6Z"></path><path d="M9 11.5 11 13.5l4-4"></path></svg>
+                </div>
+                <div>
+                    <span class="development-login-eyebrow">Development access</span>
+                    <h2 id="development-login-title">Choose your local identity</h2>
+                    <p id="development-login-description">Simulate the identity CDX would provide before entering the workspace.</p>
+                </div>
+            </div>
+            <form id="development-login-form" class="development-login-form">
+                <label class="settings-field" for="development-subject">
+                    <span>User subject</span>
+                    <input id="development-subject" name="subject" type="text" maxlength="200" placeholder="e.g. aludan" autocomplete="username" required>
+                    <small>This becomes the JWT <code>sub</code> and owns private prompts and artifacts.</small>
+                </label>
+                <label class="development-role-option" for="development-project-admin">
+                    <input id="development-project-admin" name="project_admin" type="checkbox" checked>
+                    <span>
+                        <strong>Project administrator</strong>
+                        <small>Allow this identity to create, update, import, and delete shared projects.</small>
+                    </span>
+                </label>
+                <p class="development-login-status" id="development-login-status" role="status"></p>
+                <button class="primary-action development-login-submit" id="development-login-submit" type="submit">
+                    Continue to workspace
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"></path><path d="m14 7 5 5-5 5"></path></svg>
+                </button>
+            </form>
+            <p class="development-login-note">Local development only. Production identity continues to come from CDX.</p>
+        </div>
     </div>
 
     <div class="modal-backdrop hidden" id="content-modal">
@@ -160,21 +183,6 @@
                 <button class="secondary-action" data-close-modal="settings-modal">Cancel</button>
                 <button class="primary-action" id="save-settings-btn">Save</button>
             </div>
-        </div>
-    </div>
-
-    <div class="modal-backdrop hidden" id="isolation-modal">
-        <div class="modal isolation-modal">
-            <div class="modal-header">
-                <div>
-                    <h2>Project Isolation</h2>
-                    <p id="isolation-subtitle"></p>
-                </div>
-                <button class="icon-button" data-close-modal="isolation-modal" aria-label="Close">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
-                </button>
-            </div>
-            <div class="isolation-body" id="isolation-body"></div>
         </div>
     </div>
 

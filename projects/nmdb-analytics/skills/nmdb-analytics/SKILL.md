@@ -9,13 +9,13 @@ This skill covers the FHFA National Mortgage Database (NMDB) aggregate mortgage 
 
 ## Data Sources
 
-- `../../data/nmdb-new-mortgage-statistics-national-census-areas-quarterly.csv`: quarterly new residential mortgage origination statistics.
-- `../../data/nmdb-outstanding-mortgage-statistics-national-census-areas-quarterly.csv`: quarterly outstanding residential mortgage stock statistics.
-- `../../data/nmdb-mortgage-performance-statistics-national-census-areas-quarterly.csv`: quarterly residential mortgage performance statistics.
-- `../../data/DATA_DICTIONARY.md`: dataset schema, series IDs, market definitions, geography codes, units, weighting, suppression rules, and technical notes.
-- `../../data/nmdb-aggregate-statistics-data-dictionary-technical-notes.pdf`: FHFA source document used to compile the data dictionary.
+- `data/nmdb-new-mortgage-statistics-national-census-areas-quarterly.csv`: quarterly new residential mortgage origination statistics.
+- `data/nmdb-outstanding-mortgage-statistics-national-census-areas-quarterly.csv`: quarterly outstanding residential mortgage stock statistics.
+- `data/nmdb-mortgage-performance-statistics-national-census-areas-quarterly.csv`: quarterly residential mortgage performance statistics.
+- `data/DATA_DICTIONARY.md`: dataset schema, series IDs, market definitions, geography codes, units, weighting, suppression rules, and technical notes.
+- `data/nmdb-aggregate-statistics-data-dictionary-technical-notes.pdf`: FHFA source document used to compile the data dictionary.
 
-Read `../../data/DATA_DICTIONARY.md` whenever a prompt depends on field meanings, units, available series, market or geography definitions, suppression handling, VALUE1/VALUE2 interpretation, or dataset coverage.
+Read `data/DATA_DICTIONARY.md` whenever a prompt depends on field meanings, units, available series, market or geography definitions, suppression handling, VALUE1/VALUE2 interpretation, or dataset coverage.
 
 ## Data Model
 

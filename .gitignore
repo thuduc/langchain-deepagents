@@ -3,9 +3,14 @@
 .env
 .env.*
 !.env.template
-deep-agents-sdk/__pycache__/
+**/__pycache__/
+deep-agents-sdk/runtime/
 deep-agents-sdk/static/charts/
 deep-agents-sdk/tmp_uploads/
+deep-agents-sdk/tmp_execution/
+deep-agents-sdk/*.db
+deep-agents-sdk/*.db-wal
+deep-agents-sdk/*.db-shm
 examples/
 venv/
 projects/nmdb-analytics/data/*.csv
