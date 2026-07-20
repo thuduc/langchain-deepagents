@@ -5,7 +5,7 @@ This repository contains a FastAPI web application that uses the LangChain Deep 
 ## Architecture
 
 ```text
-Browser UI
+React + TypeScript browser UI
   -> CDX (OIDC login/logout and JWT validation)
      -> x-fnma-jws-token header
         -> FastAPI REST and streaming APIs
@@ -29,24 +29,47 @@ langchain-deepagents/
 │       ├── data/
 │       └── skills/
 └── deep-agents-sdk/
-    ├── auth.py
-    ├── runtime_config.py
-    ├── server.py
+    ├── deep_agents_app/
+    │   ├── api/routers/       # FastAPI HTTP boundaries
+    │   ├── db/                # SQLite connection and schema migrations
+    │   ├── domain/            # Shared domain models
+    │   ├── repositories/      # SQL query modules
+    │   ├── runtime/           # Agent graphs, streaming, and Python execution
+    │   ├── schemas/           # Pydantic API contracts
+    │   ├── security/          # CDX and development identities
+    │   ├── services/          # Projects, sessions, uploads, and artifacts
+    │   └── application.py     # FastAPI factory and middleware
+    ├── frontend/              # React, TypeScript, Vite, and browser tests
+    ├── server.py              # Stable `uvicorn server:app` adapter
+    ├── requirements-dev.txt
     ├── requirements.txt
     ├── static/
+    │   ├── styles.css         # Shared application theme
+    │   └── dist/              # Ignored Vite production build
     └── tests/
 ```
 
-Runtime databases and generated outputs are intentionally excluded from Git.
+Application logic lives under `deep_agents_app`; `server.py` deliberately contains only the stable Uvicorn import path. Runtime databases, generated outputs, frontend build output, caches, and local environment files are intentionally excluded from Git.
 
 ## Setup
 
-Create the SDK-local virtual environment and install constrained dependencies:
+Create the SDK-local virtual environment and install constrained Python dependencies:
 
 ```bash
 python3 -m venv deep-agents-sdk/venv
 ./deep-agents-sdk/venv/bin/pip install -r deep-agents-sdk/requirements.txt
 ```
+
+Install and build the React frontend:
+
+```bash
+cd deep-agents-sdk/frontend
+npm ci
+npm run build
+cd ../..
+```
+
+The Vite output is generated under `deep-agents-sdk/static/dist/` and is not committed. FastAPI returns a clear `503` build instruction if those assets are missing.
 
 Copy the environment template:
 
@@ -124,6 +147,15 @@ Open [http://localhost:9010](http://localhost:9010).
 
 The UI and API are served by the same process and port. Whenever no `x-fnma-jws-token` header is present, the app displays a themed identity popup before loading the workspace. Enter a subject and choose whether it has `PROJECT_ADMIN`; a prior development selection is prefilled for convenience. The server signs the selection and stores it in an HTTP-only, same-site cookie for 12 hours. Its development signing key is persisted under `DEEP_AGENTS_DB_DIR`, so the cookie remains valid across server restarts. A real CDX header always takes precedence over this cookie and bypasses the popup.
 
+After frontend changes, rebuild before refreshing the FastAPI-served application:
+
+```bash
+cd deep-agents-sdk/frontend
+npm run build
+```
+
+For continuous same-port frontend development, run `npm run build -- --watch` in one terminal and Uvicorn in another. The browser still uses only `http://localhost:9010`; Vite writes updated assets for FastAPI to serve.
+
 The development popup is deliberately controlled by `DEEP_AGENTS_DEV_LOGIN_ENABLED`. Keep it unset or `false` in production. Enabling it lets any caller reaching the application choose a subject and grant itself `PROJECT_ADMIN`; it is not a substitute for CDX.
 
 Do not enable Uvicorn `--reload` while prompts are running. Agent tool calls create temporary Python files, and a source watcher can interpret those files as application changes, restart the process, and interrupt every active run. Stop active prompts before using reload mode for application development.
@@ -155,6 +187,8 @@ Administrator status does not grant access to other users' private chats or arti
 
 Authentication:
 
+- `GET /api/auth/config` — public bootstrap state for CDX or the development popup
+- `POST /api/auth/development-login` — available only when development login is enabled
 - `GET /api/auth/me`
 
 Settings:
@@ -207,14 +241,30 @@ Generated Python runs from a private per-user/project/session/run workspace, not
 ## Tests
 
 ```bash
+./deep-agents-sdk/venv/bin/pip install -r deep-agents-sdk/requirements-dev.txt
+./deep-agents-sdk/venv/bin/ruff check deep-agents-sdk/deep_agents_app deep-agents-sdk/server.py deep-agents-sdk/tests --select E4,E7,E9,F
+./deep-agents-sdk/venv/bin/vulture deep-agents-sdk/deep_agents_app deep-agents-sdk/server.py deep-agents-sdk/tests --min-confidence 80
 ./deep-agents-sdk/venv/bin/python -m unittest discover -s deep-agents-sdk/tests -v
-node --check deep-agents-sdk/static/app.js
+cd deep-agents-sdk/frontend
+npm run deadcode
+npm run lint
+npm run typecheck
+npm test
+npm run build
 ```
 
-The test suite covers the trusted-CDX claim contract, mock-CDX identity switching, header enforcement, admin authorization, shared project visibility, cross-user session isolation, per-user pruning, checkpoint namespacing, private artifact access and cleanup, private Python workspaces, recovery of misplaced project outputs, upload ownership, ZIP traversal rejection, and project-local skill discovery.
+Optional browser-level tests use Playwright after the production frontend has been built:
+
+```bash
+cd deep-agents-sdk/frontend
+npx playwright install chromium
+npm run test:e2e
+```
+
+The suites cover the trusted-CDX claim contract, mock-CDX identity switching, header enforcement, admin authorization, shared project visibility, cross-user session isolation, per-user pruning, checkpoint namespacing, private artifact access and cleanup, private Python workspaces, recovery of misplaced project outputs, upload ownership, ZIP traversal rejection, project-local skill discovery, Markdown rendering, prompt metadata, and concurrent run-state isolation.
 
 ## Security boundary
 
-Markdown responses are sanitized and the server sends a restrictive Content Security Policy. The production browser does not receive or persist the CDX header token. The mock-CDX development identity cookie is HTTP-only and restricted to localhost usage.
+Markdown responses are sanitized and the server sends a restrictive Content Security Policy. React, Marked, DOMPurify, KaTeX, and Highlight.js are compiled into self-hosted frontend assets; runtime script CDNs are not allowed. The production browser does not receive or persist the CDX header token. The mock-CDX development identity cookie is HTTP-only and restricted to development usage.
 
 Generated Python execution is not sandboxed. It runs as the server's operating-system user. Deploy this version only for trusted internal users and trusted project administrators.

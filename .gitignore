@@ -13,4 +13,9 @@ deep-agents-sdk/*.db-wal
 deep-agents-sdk/*.db-shm
 examples/
 venv/
+**/node_modules/
+deep-agents-sdk/static/dist/
+deep-agents-sdk/frontend/*.tsbuildinfo
+deep-agents-sdk/frontend/playwright-report/
+deep-agents-sdk/frontend/test-results/
 projects/nmdb-analytics/data/*.csv

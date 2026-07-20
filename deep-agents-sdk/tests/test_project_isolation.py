@@ -1,7 +1,7 @@
-import importlib.util
 import io
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -13,11 +13,12 @@ import jwt
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SERVER_PATH = REPO_ROOT / "deep-agents-sdk" / "server.py"
+SDK_ROOT = REPO_ROOT / "deep-agents-sdk"
+if str(SDK_ROOT) not in sys.path:
+    sys.path.insert(0, str(SDK_ROOT))
 
-spec = importlib.util.spec_from_file_location("server", SERVER_PATH)
-server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
+from deep_agents_app import application  # noqa: E402
+from deep_agents_app.services import workspace as server  # noqa: E402
 
 
 class MultiUserIsolationTests(unittest.TestCase):
@@ -54,7 +55,7 @@ class MultiUserIsolationTests(unittest.TestCase):
         server.init_db()
         from fastapi.testclient import TestClient
 
-        self.client = TestClient(server.app)
+        self.client = TestClient(application.app)
         self.client.__enter__()
         self.user1_headers = self._headers("user-1")
         self.user2_headers = self._headers("user-2")
