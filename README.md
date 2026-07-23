@@ -14,7 +14,7 @@ React + TypeScript browser UI
            -> Deep Agents supervisor and project skill workers
 ```
 
-CDX is the authentication boundary. The application trusts the header supplied by CDX, uses the JWT `sub` claim as the user identity, and uses the fixed `roles` claim for authorization. Only users with `PROJECT_ADMIN` may create, rename, import, replace, clear, or delete projects and update global settings.
+CDX is the authentication boundary. The application trusts the header supplied by CDX, uses the JWT `sub` claim as the user identity, and uses the fixed `roles` claim for authorization. Only users with `PROJECT_ADMIN` may create, rename, import, edit, replace, clear, or delete projects and update global settings.
 
 ## Repository layout
 
@@ -175,7 +175,7 @@ Choose the internal host and port required by the deployment, but do not expose 
 |---|---:|---:|
 | List and view shared projects | Yes | Yes |
 | View shared project contents/media | Yes | Yes |
-| Create, rename, import, clear, or delete projects | No | Yes |
+| Create, rename, import, edit, clear, or delete projects | No | Yes |
 | View own sessions, messages, and task runs | Yes | Yes |
 | View another user's sessions, messages, or artifacts | No | No |
 | Download own generated artifacts | Yes | Yes |
@@ -200,10 +200,22 @@ Shared projects:
 
 - `GET /api/projects`
 - `GET /api/projects/{project_id}`
-- `GET /api/projects/{project_id}/contents`
+- `GET /api/projects/{project_id}/contents` — compatibility listing for project contents
+- `GET /api/projects/{project_id}/directory?path=...` — lazy, immediate-child directory listing
+- `GET /api/projects/{project_id}/file-search?query=...` — project filename/path search
+- `GET /api/projects/{project_id}/file-preview?path=...` — safe format-aware preview metadata/content
+- `GET /api/projects/{project_id}/file-inline?path=...` — inline image, PDF, audio, or video bytes
+- `GET /api/projects/{project_id}/file-download?path=...` — protected project-file download
+- `GET /api/projects/{project_id}/entry-info?path=...` — file/folder size and delete-impact summary
+- `GET /api/projects/{project_id}/content-summary` — current content counts and size
+- `GET /api/projects/{project_id}/export` — download visible project content as a ZIP
 - `GET /api/projects/{project_id}/media/{path}`
 - `POST /api/projects` — admin only
 - `PUT /api/projects/{project_id}` — admin only
+- `POST /api/projects/{project_id}/folders` — add a folder, admin only
+- `POST /api/projects/{project_id}/files?parent_path=...` — add one file, admin only
+- `PUT /api/projects/{project_id}/files?path=...` — atomically replace one file, admin only
+- `DELETE /api/projects/{project_id}/entries?path=...` — delete one file or folder tree, admin only
 - `DELETE /api/projects/{project_id}` — admin only
 - `DELETE /api/projects/{project_id}/contents` — admin only
 - `GET /api/projects/{project_id}/isolation` — admin only
@@ -215,6 +227,14 @@ Admin imports:
 - `POST /api/projects/{project_id}/contents/import`
 
 Upload preview tokens are user-bound, short-lived, and single-use. ZIP paths, symlinks, entry counts, compressed upload size, and expanded size are validated. Project content is staged and swapped rather than destructively extracted in place.
+
+The project **Import** action keeps existing content by default and overwrites only paths supplied by the ZIP. When the project already contains files or custom folders, an explicit **Replace all current project content** checkbox is shown; selecting it clears the staged project copy before importing the ZIP. The **Export** action is available to authenticated users and creates a temporary ZIP containing visible files and folders while excluding hidden paths and symlinks. The temporary server archive is deleted after the download response completes.
+
+The **Project Contents** action opens a Finder-style file explorer that loads one folder at a time, supports filename/path search, and keeps large projects responsive. It previews Markdown, source code, UTF-8 text, CSV/TSV data, common image/audio/video formats, and PDFs (including page navigation and zoom). Unsupported formats remain downloadable.
+
+Authenticated users can browse, preview, and download shared project content. A `PROJECT_ADMIN` also gets contextual actions to create folders, add files, replace files, and delete files or folder trees. Replacement preserves the existing path and requires the same extension. Deletions show the number and size of affected files and require explicit confirmation. The top-level `data/` and `skills/` directories are protected from deletion. Individual uploads are limited to 250 MB, and names and paths reject traversal, hidden components, symlinks, and non-portable reserved characters.
+
+Content mutations are intentionally serialized per project and are rejected while that project has an active task run. Files are staged and published atomically, then the project's `content_revision` is incremented and the mutation is written to the audit log in the same database transaction. A failure before the database commit restores the prior filesystem state. This is a deliberately simple consistency model for a single project administrator; it avoids unnecessary optimistic-locking UI while preventing prompts from reading a half-edited project.
 
 Private chats and runs:
 
@@ -236,6 +256,8 @@ Session and artifact lookups always include the authenticated internal user ID. 
 
 Each project keeps skills under `skills/<skill-name>/SKILL.md`. On project selection, the server scans that project's skill metadata. The project agent graph is shared, while each run uses a user/project/session checkpoint thread and a user-specific artifact directory.
 
+Every successful `data/` or `skills/` edit increments `content_revision`. Data-only changes are visible to the next prompt through the shared project path and do not rebuild the agent graph. Changes under `skills/` are validated (including `SKILL.md` frontmatter and directory/name agreement) before publication, invalidate the cached project agent, and cause skills to be loaded lazily before the next prompt. Existing running prompts are never hot-reloaded because project edits are blocked until all project runs finish.
+
 Generated Python runs from a private per-user/project/session/run workspace, not from the shared project directory. Project data remains readable as `data/<filename>` through a workspace link. Generated files should be written to the `artifact_directory` returned by `get_project_context` (or `DEEP_AGENTS_RUN_ARTIFACT_DIR` inside Python). Relative generated files are automatically moved into the same run artifact directory before registration. The server audits the shared project tree and quarantines newly created project files as private artifacts; modifications or deletions of existing shared source files are logged and reported as execution errors.
 
 ## Tests
@@ -251,7 +273,10 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
+npm run test:e2e
 ```
+
+The Playwright suite copies project sources into a disposable workspace and uses separate temporary databases and generated-output directories. Its edit tests therefore cannot mutate development projects, sessions, or artifacts, even when a test fails.
 
 Optional browser-level tests use Playwright after the production frontend has been built:
 

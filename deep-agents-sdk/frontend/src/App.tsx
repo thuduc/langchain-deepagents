@@ -175,6 +175,14 @@ export default function App() {
     try { await api(`/api/projects/${project.id}`, { method: "DELETE" }); await queryClient.invalidateQueries({ queryKey: ["projects"] }); if (currentProject?.id === project.id) navigate("/"); }
     catch (error) { window.alert(error instanceof Error ? error.message : "Unable to delete project"); }
   };
+  const exportProject = (project: Project) => {
+    const link = document.createElement("a");
+    link.href = `/api/projects/${encodeURIComponent(project.id)}/export`;
+    link.download = `${project.slug}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  };
   const deleteSession = async (project: Project, session: Session) => {
     if (!window.confirm(`Delete “${session.title}” and all generated outputs? This cannot be undone.`)) return;
     try {
@@ -219,7 +227,7 @@ export default function App() {
 
   return <>
     <div className="app-shell" aria-hidden={requiresDevelopmentLogin || undefined}>
-      <Sidebar projects={projects} sessionsByProject={sessionsByProject} runs={runs} currentProjectId={currentProject?.id} currentSessionId={currentSession?.id} expanded={expanded} collapsed={sidebarCollapsed} mobileOpen={mobileOpen} isAdmin={Boolean(user?.is_project_admin)} onToggleProject={toggleProject} onNewPrompt={showNewPrompt} onSelectSession={selectSession} onDeleteSession={deleteSession} onProjectContents={setContentsProject} onProjectImport={setImportProject} onRenameProject={renameProject} onDeleteProject={deleteProject} onAddProject={createProject} onSettings={() => setSettingsOpen(true)} onCollapse={() => { const next = !sidebarCollapsed; setSidebarCollapsed(next); localStorage.setItem("sidebarCollapsed", String(next)); }} onMobileClose={() => setMobileOpen(false)} />
+      <Sidebar projects={projects} sessionsByProject={sessionsByProject} runs={runs} currentProjectId={currentProject?.id} currentSessionId={currentSession?.id} expanded={expanded} collapsed={sidebarCollapsed} mobileOpen={mobileOpen} isAdmin={Boolean(user?.is_project_admin)} onToggleProject={toggleProject} onNewPrompt={showNewPrompt} onSelectSession={selectSession} onDeleteSession={deleteSession} onProjectContents={setContentsProject} onProjectImport={setImportProject} onProjectExport={exportProject} onRenameProject={renameProject} onDeleteProject={deleteProject} onAddProject={createProject} onSettings={() => setSettingsOpen(true)} onCollapse={() => { const next = !sidebarCollapsed; setSidebarCollapsed(next); localStorage.setItem("sidebarCollapsed", String(next)); }} onMobileClose={() => setMobileOpen(false)} />
       <main className="workspace">
         <header className="workspace-header">
           <button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)} aria-label="Open sidebar"><Icon name="menu" /></button>
@@ -233,7 +241,10 @@ export default function App() {
     </div>
     {requiresDevelopmentLogin ? <DevelopmentLogin identity={authConfig.data?.development_identity} onAuthenticated={(nextUser) => { setDevelopmentUser(nextUser); queryClient.setQueryData(["auth", "me"], { user: nextUser }); }} /> : null}
     <SettingsModal open={settingsOpen} settings={settingsQuery.data?.settings} canEdit={Boolean(user?.is_project_admin)} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />
-    <ProjectContentsDialog project={contentsProject} open={Boolean(contentsProject)} onClose={() => setContentsProject(undefined)} />
+    <ProjectContentsDialog project={contentsProject} open={Boolean(contentsProject)} canEdit={Boolean(user?.is_project_admin)} onClose={() => setContentsProject(undefined)} onProjectChanged={(updatedProject) => {
+      setContentsProject(updatedProject);
+      queryClient.setQueryData<{ projects: Project[] }>(["projects"], (current) => ({ projects: (current?.projects || []).map((item) => item.id === updatedProject.id ? updatedProject : item) }));
+    }} />
     <ImportDialog open={Boolean(importProject)} targetProject={importProject} newProject={false} onClose={() => setImportProject(undefined)} onComplete={async (project) => { await queryClient.invalidateQueries({ queryKey: ["projects"] }); await queryClient.invalidateQueries({ queryKey: ["sessions", project.id] }); }} />
   </>;
 }

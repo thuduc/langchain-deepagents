@@ -5,15 +5,41 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from deep_agents_app.api.dependencies import get_current_user, require_project_admin
 from deep_agents_app.domain import CurrentUser
-from deep_agents_app.schemas import ContentImportRequest, ProjectCreateRequest, ProjectImportRequest, ProjectUpdateRequest
-from deep_agents_app.services import workspace
+from deep_agents_app.schemas import ContentImportRequest, ProjectCreateRequest, ProjectFolderCreateRequest, ProjectImportRequest, ProjectUpdateRequest
+from deep_agents_app.services import project_files, workspace
 from deep_agents_app.services import queries
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
+
+
+async def _stage_content_upload(file: UploadFile, user_id: str) -> tuple[Path, str]:
+    file_name = file.filename or ""
+    upload_dir = workspace.ensure_child_path(
+        workspace.TMP_UPLOADS_DIR,
+        workspace.TMP_UPLOADS_DIR / user_id / "content-edits",
+    )
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    staged = workspace.ensure_child_path(upload_dir, upload_dir / f"{uuid.uuid4().hex}.upload")
+    total = 0
+    try:
+        with staged.open("wb") as destination:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > project_files.PROJECT_FILE_UPLOAD_LIMIT:
+                    raise HTTPException(status_code=400, detail="File upload exceeds the 250MB limit")
+                destination.write(chunk)
+        return staged, file_name
+    except Exception:
+        staged.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
 
 
 @router.get("/projects")
@@ -65,6 +91,164 @@ def delete_project(project_id: str, user: CurrentUser = Depends(require_project_
 @router.get("/projects/{project_id}/contents")
 def project_contents(project_id: str, _: CurrentUser = Depends(get_current_user)):
     return {"items": workspace.list_project_files(workspace.get_project_root(project_id))}
+
+
+@router.get("/projects/{project_id}/directory")
+def project_directory(
+    project_id: str,
+    path: str = "",
+    _: CurrentUser = Depends(get_current_user),
+):
+    return project_files.list_directory(project_id, path)
+
+
+@router.get("/projects/{project_id}/file-search")
+def project_file_search(
+    project_id: str,
+    query: str = "",
+    _: CurrentUser = Depends(get_current_user),
+):
+    return project_files.search_files(project_id, query)
+
+
+@router.get("/projects/{project_id}/file-preview")
+def project_file_preview(
+    project_id: str,
+    path: str,
+    _: CurrentUser = Depends(get_current_user),
+):
+    return project_files.preview_file(project_id, path)
+
+
+@router.get("/projects/{project_id}/file-inline")
+def project_file_inline(
+    project_id: str,
+    path: str,
+    _: CurrentUser = Depends(get_current_user),
+):
+    file_path, media_type = project_files.inline_file(project_id, path)
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=file_path.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/projects/{project_id}/file-download")
+def project_file_download(
+    project_id: str,
+    path: str,
+    _: CurrentUser = Depends(get_current_user),
+):
+    file_path, media_type = project_files.download_file(project_id, path)
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=file_path.name,
+        content_disposition_type="attachment",
+    )
+
+
+@router.get("/projects/{project_id}/entry-info")
+def project_entry_info(
+    project_id: str,
+    path: str,
+    _: CurrentUser = Depends(get_current_user),
+):
+    return project_files.entry_info(project_id, path)
+
+
+@router.get("/projects/{project_id}/content-summary")
+def project_content_summary(
+    project_id: str,
+    _: CurrentUser = Depends(get_current_user),
+):
+    return project_files.content_summary(project_id)
+
+
+@router.get("/projects/{project_id}/export")
+def export_project(
+    project_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
+    archive_path, download_name = project_files.export_project_archive(project_id, user.id)
+    try:
+        workspace.add_audit_event(
+            user.id,
+            "project.contents.export",
+            project_id,
+            {"file_name": download_name},
+        )
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=download_name,
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
+    )
+
+
+@router.post("/projects/{project_id}/folders")
+def create_project_folder(
+    project_id: str,
+    request: ProjectFolderCreateRequest,
+    user: CurrentUser = Depends(require_project_admin),
+):
+    return project_files.create_folder(project_id, request.parent_path, request.name, user.id)
+
+
+@router.post("/projects/{project_id}/files")
+async def add_project_file(
+    project_id: str,
+    file: UploadFile = File(...),
+    parent_path: str = "",
+    user: CurrentUser = Depends(require_project_admin),
+):
+    staged, file_name = await _stage_content_upload(file, user.id)
+    try:
+        return await run_in_threadpool(
+            project_files.add_file_from_staged,
+            project_id,
+            parent_path,
+            file_name,
+            staged,
+            user.id,
+        )
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+@router.put("/projects/{project_id}/files")
+async def replace_project_file(
+    project_id: str,
+    path: str,
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(require_project_admin),
+):
+    staged, file_name = await _stage_content_upload(file, user.id)
+    try:
+        return await run_in_threadpool(
+            project_files.replace_file_from_staged,
+            project_id,
+            path,
+            file_name,
+            staged,
+            user.id,
+        )
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+@router.delete("/projects/{project_id}/entries")
+def delete_project_entry(
+    project_id: str,
+    path: str,
+    user: CurrentUser = Depends(require_project_admin),
+):
+    return project_files.delete_entry(project_id, path, user.id)
 
 
 @router.delete("/projects/{project_id}/contents")
@@ -126,18 +310,19 @@ def import_project(request: ProjectImportRequest, user: CurrentUser = Depends(re
 
 @router.post("/projects/{project_id}/contents/import")
 def import_project_contents(project_id: str, request: ContentImportRequest, user: CurrentUser = Depends(require_project_admin)):
-    workspace.ensure_no_active_project_runs(project_id)
-    project_root = workspace.get_project_root(project_id)
-    zip_path = workspace.upload_path_for_token(user.id, request.upload_token, consume=True)
-    try:
-        workspace.extract_zip(zip_path, project_root, request.mode)
-        workspace.touch_project(project_id, bump_revision=True)
-        workspace.validate_project_skills(project_id)
-        workspace.invalidate_project_agent(project_id)
-        workspace.add_audit_event(user.id, "project.contents.import", project_id, {"mode": request.mode})
-        return {"project": workspace.public_project(workspace.get_project(project_id)), "items": workspace.list_project_files(project_root)}
-    finally:
-        workspace.cleanup_upload_preview(request.upload_token, zip_path)
+    with workspace.project_content_lock(project_id):
+        workspace.ensure_no_active_project_runs(project_id)
+        project_root = workspace.get_project_root(project_id)
+        zip_path = workspace.upload_path_for_token(user.id, request.upload_token, consume=True)
+        try:
+            workspace.extract_zip(zip_path, project_root, request.mode)
+            workspace.touch_project(project_id, bump_revision=True)
+            workspace.validate_project_skills(project_id)
+            workspace.invalidate_project_agent(project_id)
+            workspace.add_audit_event(user.id, "project.contents.import", project_id, {"mode": request.mode})
+            return {"project": workspace.public_project(workspace.get_project(project_id)), "items": workspace.list_project_files(project_root)}
+        finally:
+            workspace.cleanup_upload_preview(request.upload_token, zip_path)
 
 
 @router.get("/projects/{project_id}/media/{media_path:path}")

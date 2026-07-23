@@ -6,6 +6,7 @@ from .requests import (
     ContentImportRequest,
     DevelopmentLoginRequest,
     ProjectCreateRequest,
+    ProjectFolderCreateRequest,
     ProjectImportRequest,
     ProjectUpdateRequest,
     SessionCreateRequest,
@@ -14,6 +15,6 @@ from .requests import (
 
 __all__ = [
     "ChatRequest", "ChatResponse", "ContentImportRequest", "DevelopmentLoginRequest",
-    "ProjectCreateRequest", "ProjectImportRequest", "ProjectUpdateRequest",
+    "ProjectCreateRequest", "ProjectFolderCreateRequest", "ProjectImportRequest", "ProjectUpdateRequest",
     "SessionCreateRequest", "SettingsUpdateRequest",
 ]

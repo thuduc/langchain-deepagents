@@ -5,15 +5,8 @@
 }
 
 .inline-project-menu {
-  display: block;
-  left: 2.25rem;
-  position: absolute;
-  top: calc(100% + 0.25rem);
-  z-index: 30;
-}
-
-.project-row {
-  position: relative;
+  width: 10.5rem;
+  max-width: calc(100vw - 1rem);
 }
 
 .upload-dropzone {
@@ -33,10 +26,4 @@
 
 .development-login-backdrop {
   z-index: 100;
-}
-
-@media (max-width: 760px) {
-  .inline-project-menu {
-    left: 1rem;
-  }
 }

@@ -136,51 +136,52 @@ def create_task_run(
     session_id: str,
     prompt: str,
 ) -> Dict[str, Any]:
-    project = get_project(project_id)
-    run_id = uuid.uuid4().hex
-    now = utc_now()
-    with get_db_connection() as conn:
-        active_count = conn.execute(
-            "SELECT COUNT(*) AS count FROM task_runs WHERE user_id = ? AND status = 'running'",
-            (user_id,),
-        ).fetchone()["count"]
-        concurrent_limit = bounded_env_int("MAX_CONCURRENT_RUNS_PER_USER", 3, 1, 20)
-        if active_count >= concurrent_limit:
-            raise HTTPException(
-                status_code=429,
-                detail="Concurrent task limit reached for this user",
+    with state.project_content_lock(project_id):
+        project = get_project(project_id)
+        run_id = uuid.uuid4().hex
+        now = utc_now()
+        with get_db_connection() as conn:
+            active_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM task_runs WHERE user_id = ? AND status = 'running'",
+                (user_id,),
+            ).fetchone()["count"]
+            concurrent_limit = bounded_env_int("MAX_CONCURRENT_RUNS_PER_USER", 3, 1, 20)
+            if active_count >= concurrent_limit:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Concurrent task limit reached for this user",
+                )
+            active = conn.execute(
+                """
+                SELECT 1 FROM task_runs
+                WHERE user_id = ? AND session_id = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (user_id, session_id),
+            ).fetchone()
+            if active:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This chat already has a task running",
+                )
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    id, project_id, session_id, user_id, project_revision,
+                    status, latest_status, prompt, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    project_id,
+                    session_id,
+                    user_id,
+                    project["content_revision"],
+                    "Preparing the agent workspace…",
+                    prompt,
+                    now,
+                ),
             )
-        active = conn.execute(
-            """
-            SELECT 1 FROM task_runs
-            WHERE user_id = ? AND session_id = ? AND status = 'running'
-            LIMIT 1
-            """,
-            (user_id, session_id),
-        ).fetchone()
-        if active:
-            raise HTTPException(
-                status_code=409,
-                detail="This chat already has a task running",
-            )
-        conn.execute(
-            """
-            INSERT INTO task_runs (
-                id, project_id, session_id, user_id, project_revision,
-                status, latest_status, prompt, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
-            """,
-            (
-                run_id,
-                project_id,
-                session_id,
-                user_id,
-                project["content_revision"],
-                "Preparing the agent workspace…",
-                prompt,
-                now,
-            ),
-        )
     context = create_run_context(user_id, project_id, session_id, run_id)
     return {"id": run_id, "context": context, "created_at": now}
 

@@ -22,6 +22,11 @@ class ContentImportRequest(BaseModel):
     mode: str = "merge"
 
 
+class ProjectFolderCreateRequest(BaseModel):
+    parent_path: str = Field(default="", max_length=2_000)
+    name: str = Field(..., min_length=1, max_length=255)
+
+
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 

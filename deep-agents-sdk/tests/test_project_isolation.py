@@ -213,6 +213,323 @@ class MultiUserIsolationTests(unittest.TestCase):
             self.assertNotIn("path", projects[0])
             self.assertNotIn("relative_path", projects[0])
 
+    def test_project_file_explorer_is_lazy_format_aware_and_path_safe(self):
+        project_root = server.get_project_root("hpi-analytics")
+        data_dir = project_root / "data"
+        nested_dir = data_dir / "reports"
+        nested_dir.mkdir()
+        (data_dir / "README.md").write_text(
+            "# HPI data\n\nA **Markdown** preview.\n", encoding="utf-8"
+        )
+        (data_dir / "sample.csv").write_text(
+            "division,index\nNational,100\nPacific,143\n", encoding="utf-8"
+        )
+        (nested_dir / "analysis.py").write_text(
+            "print('project preview')\n", encoding="utf-8"
+        )
+        (data_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\npreview")
+        (data_dir / "notes.pdf").write_bytes(b"%PDF-1.4\n% preview")
+        (data_dir / "archive.zip").write_bytes(b"PK\x03\x04")
+        (data_dir / ".private.txt").write_text("hidden", encoding="utf-8")
+        outside = self.tmp_dir / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        (data_dir / "linked.txt").symlink_to(outside)
+
+        root = self.client.get(
+            "/api/projects/hpi-analytics/directory",
+            headers=self.user1_headers,
+        )
+        self.assertEqual(root.status_code, 200)
+        root_items = root.json()["items"]
+        self.assertEqual([item["name"] for item in root_items], ["data", "skills"])
+        self.assertTrue(all(item["type"] == "directory" for item in root_items))
+
+        directory = self.client.get(
+            "/api/projects/hpi-analytics/directory",
+            headers=self.user1_headers,
+            params={"path": "data"},
+        )
+        self.assertEqual(directory.status_code, 200)
+        names = [item["name"] for item in directory.json()["items"]]
+        self.assertEqual(names[0], "reports")
+        self.assertIn("README.md", names)
+        self.assertNotIn(".private.txt", names)
+        self.assertNotIn("linked.txt", names)
+
+        markdown = self.client.get(
+            "/api/projects/hpi-analytics/file-preview",
+            headers=self.user1_headers,
+            params={"path": "data/README.md"},
+        )
+        self.assertEqual(markdown.status_code, 200)
+        self.assertEqual(markdown.json()["kind"], "markdown")
+        self.assertIn("A **Markdown** preview", markdown.json()["content"])
+
+        csv_preview = self.client.get(
+            "/api/projects/hpi-analytics/file-preview",
+            headers=self.user1_headers,
+            params={"path": "data/sample.csv"},
+        )
+        self.assertEqual(csv_preview.status_code, 200)
+        self.assertEqual(csv_preview.json()["kind"], "csv")
+        self.assertEqual(csv_preview.json()["columns"], ["division", "index"])
+        self.assertEqual(csv_preview.json()["rows"][1], ["Pacific", "143"])
+
+        code = self.client.get(
+            "/api/projects/hpi-analytics/file-preview",
+            headers=self.user1_headers,
+            params={"path": "data/reports/analysis.py"},
+        ).json()
+        self.assertEqual((code["kind"], code["language"]), ("code", "python"))
+
+        image = self.client.get(
+            "/api/projects/hpi-analytics/file-preview",
+            headers=self.user1_headers,
+            params={"path": "data/chart.png"},
+        ).json()
+        self.assertEqual((image["kind"], image["mime_type"]), ("image", "image/png"))
+        inline = self.client.get(
+            "/api/projects/hpi-analytics/file-inline",
+            headers=self.user1_headers,
+            params={"path": "data/chart.png"},
+        )
+        self.assertEqual(inline.status_code, 200)
+        self.assertEqual(inline.headers["content-type"], "image/png")
+        self.assertIn("inline", inline.headers["content-disposition"])
+
+        unsupported = self.client.get(
+            "/api/projects/hpi-analytics/file-preview",
+            headers=self.user1_headers,
+            params={"path": "data/archive.zip"},
+        ).json()
+        self.assertEqual(unsupported["kind"], "unsupported")
+        download = self.client.get(
+            "/api/projects/hpi-analytics/file-download",
+            headers=self.user1_headers,
+            params={"path": "data/archive.zip"},
+        )
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("attachment", download.headers["content-disposition"])
+
+        summary = self.client.get(
+            "/api/projects/hpi-analytics/content-summary",
+            headers=self.user1_headers,
+        )
+        self.assertEqual(summary.status_code, 200)
+        self.assertTrue(summary.json()["has_content"])
+        self.assertGreaterEqual(summary.json()["file_count"], 7)
+
+        exported = self.client.get(
+            "/api/projects/hpi-analytics/export",
+            headers=self.user1_headers,
+        )
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(exported.headers["content-type"], "application/zip")
+        self.assertIn("hpi-analytics.zip", exported.headers["content-disposition"])
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            names = archive.namelist()
+            self.assertIn("data/README.md", names)
+            self.assertIn("skills/hpi-analysis/SKILL.md", names)
+            self.assertNotIn("data/.private.txt", names)
+            self.assertNotIn("data/linked.txt", names)
+
+        search = self.client.get(
+            "/api/projects/hpi-analytics/file-search",
+            headers=self.user1_headers,
+            params={"query": "analysis"},
+        ).json()
+        self.assertIn(
+            "data/reports/analysis.py",
+            [item["path"] for item in search["items"]],
+        )
+
+        for unsafe_path in (
+            "../outside.txt",
+            "data/.private.txt",
+            "data/linked.txt",
+        ):
+            response = self.client.get(
+                "/api/projects/hpi-analytics/file-preview",
+                headers=self.user1_headers,
+                params={"path": unsafe_path},
+            )
+            self.assertEqual(response.status_code, 404, unsafe_path)
+        self.assertEqual(
+            self.client.get(
+                "/api/projects/hpi-analytics/file-preview",
+                params={"path": "data/README.md"},
+            ).status_code,
+            401,
+        )
+
+    def test_project_admin_can_atomically_manage_folders_and_files(self):
+        initial_revision = server.get_project("hpi-analytics")["content_revision"]
+
+        denied = self.client.post(
+            "/api/projects/hpi-analytics/folders",
+            headers=self.user1_headers,
+            json={"parent_path": "data", "name": "reports"},
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        with patch.object(server, "invalidate_project_agent") as invalidate:
+            created_folder = self.client.post(
+                "/api/projects/hpi-analytics/folders",
+                headers=self.admin_headers,
+                json={"parent_path": "data", "name": "reports"},
+            )
+            self.assertEqual(created_folder.status_code, 200)
+            self.assertEqual(created_folder.json()["item"]["path"], "data/reports")
+            self.assertEqual(invalidate.call_count, 0)
+
+            added = self.client.post(
+                "/api/projects/hpi-analytics/files",
+                headers=self.admin_headers,
+                params={"parent_path": "data/reports"},
+                files={"file": ("summary.csv", b"division,index\nNational,100\n", "text/csv")},
+            )
+            self.assertEqual(added.status_code, 200)
+            self.assertEqual(added.json()["item"]["path"], "data/reports/summary.csv")
+            self.assertEqual(invalidate.call_count, 0)
+
+            duplicate = self.client.post(
+                "/api/projects/hpi-analytics/files",
+                headers=self.admin_headers,
+                params={"parent_path": "data/reports"},
+                files={"file": ("summary.csv", b"duplicate", "text/csv")},
+            )
+            self.assertEqual(duplicate.status_code, 409)
+
+            mismatch = self.client.put(
+                "/api/projects/hpi-analytics/files",
+                headers=self.admin_headers,
+                params={"path": "data/reports/summary.csv"},
+                files={"file": ("summary.json", b"{}", "application/json")},
+            )
+            self.assertEqual(mismatch.status_code, 400)
+
+            replaced = self.client.put(
+                "/api/projects/hpi-analytics/files",
+                headers=self.admin_headers,
+                params={"path": "data/reports/summary.csv"},
+                files={"file": ("summary-v2.csv", b"division,index\nPacific,140\n", "text/csv")},
+            )
+            self.assertEqual(replaced.status_code, 200)
+            self.assertEqual(
+                (server.get_project_root("hpi-analytics") / "data/reports/summary.csv").read_text(encoding="utf-8"),
+                "division,index\nPacific,140\n",
+            )
+            self.assertEqual(invalidate.call_count, 0)
+
+            info = self.client.get(
+                "/api/projects/hpi-analytics/entry-info",
+                headers=self.admin_headers,
+                params={"path": "data/reports"},
+            )
+            self.assertEqual(info.status_code, 200)
+            self.assertEqual(info.json()["descendant_count"], 1)
+            self.assertGreater(info.json()["total_size"], 0)
+
+            deleted_file = self.client.delete(
+                "/api/projects/hpi-analytics/entries",
+                headers=self.admin_headers,
+                params={"path": "data/reports/summary.csv"},
+            )
+            self.assertEqual(deleted_file.status_code, 200)
+            deleted_folder = self.client.delete(
+                "/api/projects/hpi-analytics/entries",
+                headers=self.admin_headers,
+                params={"path": "data/reports"},
+            )
+            self.assertEqual(deleted_folder.status_code, 200)
+            self.assertEqual(invalidate.call_count, 0)
+
+            skill_folder = self.client.post(
+                "/api/projects/hpi-analytics/folders",
+                headers=self.admin_headers,
+                json={"parent_path": "skills", "name": "new-skill"},
+            )
+            self.assertEqual(skill_folder.status_code, 200)
+            self.assertEqual(invalidate.call_count, 1)
+
+            invalid_skill = self.client.post(
+                "/api/projects/hpi-analytics/files",
+                headers=self.admin_headers,
+                params={"parent_path": "skills/new-skill"},
+                files={"file": ("SKILL.md", b"# Missing frontmatter\n", "text/markdown")},
+            )
+            self.assertEqual(invalid_skill.status_code, 422)
+            self.assertFalse(
+                (server.get_project_root("hpi-analytics") / "skills/new-skill/SKILL.md").exists()
+            )
+
+            valid_skill = self.client.post(
+                "/api/projects/hpi-analytics/files",
+                headers=self.admin_headers,
+                params={"parent_path": "skills/new-skill"},
+                files={
+                    "file": (
+                        "SKILL.md",
+                        b"---\nname: new-skill\ndescription: A valid test skill.\n---\n",
+                        "text/markdown",
+                    )
+                },
+            )
+            self.assertEqual(valid_skill.status_code, 200)
+            self.assertEqual(invalidate.call_count, 2)
+
+        protected = self.client.delete(
+            "/api/projects/hpi-analytics/entries",
+            headers=self.admin_headers,
+            params={"path": "data"},
+        )
+        self.assertEqual(protected.status_code, 400)
+
+        final_revision = server.get_project("hpi-analytics")["content_revision"]
+        self.assertEqual(final_revision, initial_revision + 7)
+        with server.get_db_connection() as conn:
+            actions = [
+                row["action"]
+                for row in conn.execute(
+                    "SELECT action FROM audit_events WHERE project_id = ? ORDER BY id",
+                    ("hpi-analytics",),
+                ).fetchall()
+            ]
+        self.assertEqual(
+            actions,
+            [
+                "project.folder.create",
+                "project.file.create",
+                "project.file.replace",
+                "project.entry.delete",
+                "project.entry.delete",
+                "project.folder.create",
+                "project.file.create",
+            ],
+        )
+
+    def test_project_content_mutations_are_blocked_during_active_runs(self):
+        user_id = self._user_id(self.user1_headers)
+        session = server.create_session(user_id, "hpi-analytics", "Active edit guard")
+        run = server.create_task_run(
+            user_id,
+            "hpi-analytics",
+            session["id"],
+            "keep project busy",
+        )
+        try:
+            response = self.client.post(
+                "/api/projects/hpi-analytics/folders",
+                headers=self.admin_headers,
+                json={"parent_path": "data", "name": "blocked"},
+            )
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("while tasks are running", response.json()["detail"])
+            self.assertFalse(server.get_project_root("hpi-analytics").joinpath("data/blocked").exists())
+        finally:
+            server.finish_task_run(run["id"], "completed")
+            server.cleanup_run_work(run["context"])
+
     def test_only_project_admin_can_mutate_projects_and_settings(self):
         denied = self.client.post(
             "/api/projects", headers=self.user1_headers, json={"name": "Private"}
@@ -223,6 +540,12 @@ class MultiUserIsolationTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 200)
         project_id = created.json()["project"]["id"]
+        summary = self.client.get(
+            f"/api/projects/{project_id}/content-summary",
+            headers=self.user1_headers,
+        )
+        self.assertEqual(summary.status_code, 200)
+        self.assertFalse(summary.json()["has_content"])
         deleted = self.client.delete(
             f"/api/projects/{project_id}", headers=self.admin_headers
         )

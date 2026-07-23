@@ -3,7 +3,8 @@ import type { SVGProps } from "react";
 type IconName =
   | "add" | "close" | "copy" | "check" | "edit" | "folder" | "folderOpen"
   | "menu" | "more" | "moon" | "panel" | "settings" | "trash" | "upload"
-  | "download" | "file" | "arrow";
+  | "download" | "file" | "arrow" | "chevronRight" | "search" | "code"
+  | "image" | "table";
 
 const paths: Record<IconName, React.ReactNode> = {
   add: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
@@ -23,6 +24,11 @@ const paths: Record<IconName, React.ReactNode> = {
   download: <><path d="M12 4v11" /><path d="m8 11 4 4 4-4" /><path d="M5 20h14" /></>,
   file: <><path d="M7 3h7l4 4v14H7z" /><path d="M14 3v5h5" /></>,
   arrow: <><path d="M5 12h14" /><path d="m14 7 5 5-5 5" /></>,
+  chevronRight: <path d="m9 18 6-6-6-6" />,
+  search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
+  code: <><path d="m8 9-3 3 3 3" /><path d="m16 9 3 3-3 3" /><path d="m14 5-4 14" /></>,
+  image: <><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="9" cy="10" r="2" /><path d="m21 15-4-4L5 20" /></>,
+  table: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 10h18" /><path d="M9 4v16" /></>,
 };
 
 export function Icon({ name, ...props }: SVGProps<SVGSVGElement> & { name: IconName }) {

@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,9 @@ from deep_agents_app.db import connect, initialize_schema  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+_PROJECT_CONTENT_LOCKS: Dict[str, threading.RLock] = {}
+_PROJECT_CONTENT_LOCKS_GUARD = threading.Lock()
+
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -43,6 +47,12 @@ def environment_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def project_content_lock(project_id: str) -> threading.RLock:
+    """Serialize a project edit with the creation of new task runs."""
+    with _PROJECT_CONTENT_LOCKS_GUARD:
+        return _PROJECT_CONTENT_LOCKS.setdefault(project_id, threading.RLock())
 
 
 DEVELOPMENT_LOGIN_ENABLED = environment_flag("DEEP_AGENTS_DEV_LOGIN_ENABLED")
@@ -646,6 +656,34 @@ def touch_project(project_id: str, bump_revision: bool = False) -> None:
             conn.execute(
                 "UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id)
             )
+
+
+def record_project_content_mutation(
+    user_id: str,
+    project_id: str,
+    action: str,
+    details: Dict[str, Any],
+) -> None:
+    """Atomically bump the shared content revision and write its audit event."""
+    now = utc_now()
+    with get_db_connection() as conn:
+        updated = conn.execute(
+            """
+            UPDATE projects
+            SET updated_at = ?, content_revision = content_revision + 1
+            WHERE id = ? AND status = 'active'
+            """,
+            (now, project_id),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Project not found")
+        conn.execute(
+            """
+            INSERT INTO audit_events (user_id, action, project_id, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, action, project_id, json.dumps(details, sort_keys=True), now),
+        )
 
 
 def create_project_record(name: str, created_by: str) -> Dict[str, Any]:

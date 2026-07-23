@@ -85,6 +85,18 @@ export interface FileItem {
   type: "file" | "directory";
   size: number;
   updated_at?: string;
+  has_children?: boolean;
+  mime_type?: string;
+}
+
+export interface ProjectFilePreview extends FileItem {
+  kind: "markdown" | "code" | "text" | "csv" | "image" | "pdf" | "video" | "audio" | "unsupported";
+  language?: string | null;
+  content?: string;
+  columns?: string[];
+  rows?: string[][];
+  truncated?: boolean;
+  message?: string;
 }
 
 export interface UploadPreview {

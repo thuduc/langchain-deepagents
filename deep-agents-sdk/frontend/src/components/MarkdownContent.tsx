@@ -3,16 +3,22 @@ import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import css from "highlight.js/lib/languages/css";
+import c from "highlight.js/lib/languages/c";
+import cpp from "highlight.js/lib/languages/cpp";
 import diff from "highlight.js/lib/languages/diff";
 import dockerfile from "highlight.js/lib/languages/dockerfile";
+import go from "highlight.js/lib/languages/go";
 import ini from "highlight.js/lib/languages/ini";
 import java from "highlight.js/lib/languages/java";
 import javascript from "highlight.js/lib/languages/javascript";
 import json from "highlight.js/lib/languages/json";
+import kotlin from "highlight.js/lib/languages/kotlin";
 import markdown from "highlight.js/lib/languages/markdown";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import python from "highlight.js/lib/languages/python";
 import r from "highlight.js/lib/languages/r";
+import ruby from "highlight.js/lib/languages/ruby";
+import rust from "highlight.js/lib/languages/rust";
 import sql from "highlight.js/lib/languages/sql";
 import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
@@ -34,9 +40,10 @@ const CODE_LANGUAGE_ALIASES: Record<string, string> = {
 };
 
 const CODE_LANGUAGE_LABELS: Record<string, string> = {
-  bash: "Shell", css: "CSS", diff: "Diff", dockerfile: "Dockerfile", ini: "TOML / INI",
-  java: "Java", javascript: "JavaScript", json: "JSON", markdown: "Markdown", plaintext: "Text",
-  python: "Python", r: "R", sql: "SQL", typescript: "TypeScript", xml: "HTML / XML", yaml: "YAML",
+  bash: "Shell", c: "C", cpp: "C++", css: "CSS", diff: "Diff", dockerfile: "Dockerfile",
+  go: "Go", ini: "TOML / INI", java: "Java", javascript: "JavaScript", json: "JSON",
+  kotlin: "Kotlin", markdown: "Markdown", plaintext: "Text", python: "Python", r: "R",
+  ruby: "Ruby", rust: "Rust", sql: "SQL", typescript: "TypeScript", xml: "HTML / XML", yaml: "YAML",
 };
 
 function escapeHtml(value: string): string {
@@ -47,8 +54,8 @@ function escapeHtml(value: string): string {
 function configureHighlighting(): void {
   if (highlightingConfigured) return;
   Object.entries({
-    bash, css, diff, dockerfile, ini, java, javascript, json, markdown, plaintext,
-    python, r, sql, typescript, xml, yaml,
+    bash, c, cpp, css, diff, dockerfile, go, ini, java, javascript, json, kotlin,
+    markdown, plaintext, python, r, ruby, rust, sql, typescript, xml, yaml,
   }).forEach(([name, language]) => hljs.registerLanguage(name, language));
   highlightingConfigured = true;
 }

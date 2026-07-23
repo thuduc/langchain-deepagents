@@ -27,3 +27,160 @@ test("mobile project navigation opens and closes", async ({ page }) => {
   await page.getByRole("button", { name: "Close sidebar" }).click();
   await expect(page.locator(".sidebar")).not.toHaveClass(/open/);
 });
+
+test("project actions are complete and dismiss outside in every expansion state", async ({ page }) => {
+  await page.goto("/");
+  await page.getByPlaceholder("e.g. aludan").fill("playwright-project-menu-user");
+  await page.getByRole("button", { name: "Continue to workspace" }).click();
+
+  const hpiProject = page.getByRole("button", { name: "HPI Analytics", exact: true });
+  const nmdbProject = page.getByRole("button", { name: "NMDB Analytics", exact: true });
+  if (await hpiProject.getAttribute("aria-expanded") === "true") await hpiProject.click();
+  if (await nmdbProject.getAttribute("aria-expanded") === "true") await nmdbProject.click();
+
+  const trigger = page.getByTitle("Project actions for HPI Analytics");
+  const menu = page.getByRole("menu", { name: "HPI Analytics actions" });
+  await trigger.click();
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Contents", exact: true })).toBeInViewport();
+  await expect(menu.getByRole("menuitem", { name: "Rename", exact: true })).toBeInViewport();
+  await expect(menu.getByRole("menuitem", { name: "Import", exact: true })).toBeInViewport();
+  await expect(menu.getByRole("menuitem", { name: "Export", exact: true })).toBeInViewport();
+
+  const downloadPromise = page.waitForEvent("download");
+  await menu.getByRole("menuitem", { name: "Export", exact: true }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("hpi-analytics.zip");
+
+  await trigger.click();
+  await page.locator(".workspace-title").click();
+  await expect(menu).toHaveCount(0);
+
+  await hpiProject.click();
+  await nmdbProject.click();
+  await trigger.click();
+  await expect(menu.getByRole("menuitem", { name: "Contents", exact: true })).toBeInViewport();
+  await expect(menu.getByRole("menuitem", { name: "Rename", exact: true })).toBeInViewport();
+  await expect(menu.getByRole("menuitem", { name: "Import", exact: true })).toBeInViewport();
+  await expect(menu.getByRole("menuitem", { name: "Export", exact: true })).toBeInViewport();
+
+  await menu.getByRole("menuitem", { name: "Import", exact: true }).click();
+  const importDialog = page.getByRole("dialog", { name: "Import Project Contents" });
+  await expect(importDialog.getByRole("checkbox", { name: /Replace all current project content/ })).toBeVisible();
+  await expect(importDialog.getByRole("checkbox", { name: /Replace all current project content/ })).not.toBeChecked();
+  await importDialog.getByRole("button", { name: "Close" }).click();
+});
+
+test("project contents supports folder navigation, search, and rich previews", async ({ page }) => {
+  await page.goto("/");
+  await page.getByPlaceholder("e.g. aludan").fill("playwright-file-explorer-user");
+  await page.getByRole("button", { name: "Continue to workspace" }).click();
+
+  await page.getByTitle("Project actions for HPI Analytics").click();
+  await page.getByRole("menuitem", { name: "Contents", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Project Contents" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("treeitem", { name: /^data$/ })).toBeVisible();
+  await expect(dialog.getByRole("treeitem", { name: /^skills$/ })).toBeVisible();
+
+  await dialog.getByRole("treeitem", { name: /^skills$/ }).click();
+  await dialog.getByRole("treeitem", { name: /^hpi-analysis$/ }).click();
+  await dialog.getByRole("treeitem", { name: /README\.md/ }).click();
+  await expect(dialog.getByRole("heading", { name: "Testing the HPI Analysis Skill in Codex" })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: /Download/ })).toBeVisible();
+
+  await dialog.getByRole("textbox", { name: "Search project files" }).fill("browser-preview-fixture");
+  const imageResult = dialog.getByRole("treeitem", { name: /browser-preview-fixture\.png/ });
+  await expect(imageResult).toBeVisible();
+  await imageResult.click();
+  await expect(dialog.getByRole("img", { name: /browser-preview-fixture\.png preview/ })).toBeVisible();
+
+  await dialog.getByRole("textbox", { name: "Search project files" }).fill("");
+  await dialog.getByRole("treeitem", { name: /^data$/ }).click();
+  await dialog.getByRole("treeitem", { name: /hpi_master\.csv/ }).click();
+  const table = dialog.getByRole("table");
+  await expect(table).toBeVisible();
+  await expect(table.getByRole("columnheader", { name: "hpi_type" })).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "NMDB Analytics", exact: true }).click();
+  await page.getByTitle("Project actions for NMDB Analytics").click();
+  await page.getByRole("menuitem", { name: "Contents", exact: true }).click();
+  const nmdbDialog = page.getByRole("dialog", { name: "Project Contents" });
+  await nmdbDialog.getByRole("textbox", { name: "Search project files" }).fill("technical-notes");
+  await nmdbDialog.getByRole("treeitem", { name: /technical-notes\.pdf/ }).click();
+  await expect(nmdbDialog.locator("canvas[aria-label*='technical-notes.pdf']")).toBeVisible();
+  await expect(nmdbDialog.getByRole("button", { name: "Next PDF page" })).toBeEnabled();
+  await nmdbDialog.getByRole("button", { name: "Next PDF page" }).click();
+  await expect(nmdbDialog.getByText(/Page 2 of/)).toBeVisible();
+});
+
+test("project administrators can safely edit project contents", async ({ page }) => {
+  const uniqueSuffix = Date.now();
+  const projectName = `Explorer Edit ${uniqueSuffix}`;
+  const projectId = `explorer-edit-${uniqueSuffix}`;
+
+  await page.goto("/");
+  await page.getByPlaceholder("e.g. aludan").fill("playwright-project-editor");
+  await page.getByRole("button", { name: "Continue to workspace" }).click();
+
+  page.once("dialog", (dialog) => dialog.accept(projectName));
+  await page.getByRole("button", { name: "Import new project" }).click();
+  await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/new$`));
+
+  try {
+    await page.getByTitle(`Project actions for ${projectName}`).click();
+    await page.getByRole("menuitem", { name: "Import", exact: true }).click();
+    const emptyImportDialog = page.getByRole("dialog", { name: "Import Project Contents" });
+    await expect(emptyImportDialog.getByRole("checkbox", { name: /Replace all current project content/ })).toHaveCount(0);
+    await emptyImportDialog.getByRole("button", { name: "Close" }).click();
+
+    await page.getByTitle(`Project actions for ${projectName}`).click();
+    await page.getByRole("menuitem", { name: "Contents", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Project Contents" });
+    await expect(dialog).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Actions for data" }).click();
+    await page.getByRole("menuitem", { name: "New folder", exact: true }).click();
+    const folderDialog = page.getByRole("dialog", { name: "New folder" });
+    await folderDialog.getByRole("textbox", { name: "Folder name" }).fill("reports");
+    await folderDialog.getByRole("button", { name: "Create folder" }).click();
+    await expect(dialog.getByText("reports was created.")).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Actions for reports" }).click();
+    await page.getByRole("menuitem", { name: "Add file", exact: true }).click();
+    await dialog.locator('input[type="file"]').setInputFiles({
+      name: "notes.md",
+      mimeType: "text/markdown",
+      buffer: Buffer.from("# First version\n\nCreated from the project explorer."),
+    });
+    await expect(dialog.getByText("notes.md was added.")).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "First version" })).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Replace", exact: true }).click();
+    await dialog.locator('input[type="file"]').setInputFiles({
+      name: "notes.md",
+      mimeType: "text/markdown",
+      buffer: Buffer.from("# Second version\n\nThe replacement is visible."),
+    });
+    const replaceDialog = page.getByRole("dialog", { name: "Replace file" });
+    await replaceDialog.getByRole("button", { name: "Replace file" }).click();
+    await expect(dialog.getByText("notes.md was replaced.")).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "Second version" })).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Delete", exact: true }).click();
+    const deleteFileDialog = page.getByRole("dialog", { name: "Delete file?" });
+    await expect(deleteFileDialog.getByText("This cannot be undone.")).toBeVisible();
+    await deleteFileDialog.getByRole("button", { name: "Delete permanently" }).click();
+    await expect(dialog.getByText("notes.md was deleted.")).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Actions for reports" }).click();
+    await page.getByRole("menuitem", { name: "Delete folder", exact: true }).click();
+    const deleteFolderDialog = page.getByRole("dialog", { name: "Delete folder?" });
+    await deleteFolderDialog.getByRole("button", { name: "Delete permanently" }).click();
+    await expect(dialog.getByText("reports was deleted.")).toBeVisible();
+  } finally {
+    const cleanupResponse = await page.context().request.delete(`/api/projects/${encodeURIComponent(projectId)}`);
+    expect(cleanupResponse.ok()).toBeTruthy();
+  }
+});
