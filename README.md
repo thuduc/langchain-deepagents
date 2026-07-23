@@ -79,6 +79,56 @@ cp .env.template .env
 
 Configure the Portkey gateway, model allowlist, storage roots, and optional development login in `.env`.
 
+## Production frontend build
+
+The React application is compiled into static, self-hosted files that FastAPI serves from `deep-agents-sdk/static/dist/`. Build and validate a production release from the repository root:
+
+```bash
+cd deep-agents-sdk/frontend
+npm ci
+npm run deadcode
+npm run lint
+npm run typecheck
+npm test
+npm run build
+```
+
+`npm run build` runs the TypeScript build followed by Vite. Vite empties and recreates `deep-agents-sdk/static/dist/`, including `index.html`, `.vite/manifest.json`, hashed JavaScript and CSS bundles, fonts, and PDF.js assets. Commit or package the entire directory; do not select individual files from it.
+
+The frontend currently has no environment-specific `VITE_*` build variables, so one validated build can be promoted across deployment environments. Runtime configuration remains in the FastAPI environment. Do not put secrets into frontend build variables because any such value is embedded in browser-readable JavaScript.
+
+### Checking production assets into Git
+
+Checking in the generated assets is a reasonable option when the Docker image must be built without Node.js. Remove this line from `.gitignore`:
+
+```gitignore
+deep-agents-sdk/static/dist/
+```
+
+Then build and stage the generated output together with the React source changes:
+
+```bash
+cd deep-agents-sdk/frontend
+npm ci
+npm run build
+cd ../..
+git add deep-agents-sdk/frontend deep-agents-sdk/static/dist
+git status
+```
+
+Treat `static/dist` as generated output: never edit it manually, always use the locked dependencies from `package-lock.json`, and use one pinned Node.js version for all release builds. A clean rebuild should leave no generated differences:
+
+```bash
+cd deep-agents-sdk/frontend
+npm ci
+npm run build
+git diff --exit-code -- ../static/dist
+```
+
+The production Docker build can then remain Python-only. It must copy `deep-agents-sdk/static/dist/` into the image at the same path and must not exclude it through `.dockerignore`. Node.js, npm, `node_modules`, TypeScript caches, test reports, and Playwright output are not required in the image.
+
+An alternative is to build `static/dist` in a separate release pipeline and pass it to the Docker build as a versioned artifact. This avoids generated files in Git while still keeping Node.js out of the Docker build and runtime image.
+
 ### CDX authentication contract
 
 In production, CDX implements the OIDC login and logout flows. CDX validates the JWT signature, issuer, audience, and lifetime, removes any client-supplied `x-fnma-jws-token`, and writes its validated token into that header before forwarding the request.
