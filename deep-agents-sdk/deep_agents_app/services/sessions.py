@@ -1,18 +1,22 @@
-import shutil
+"""Chat sessions and task runs: the lifecycle around a single prompt.
+
+A session is one conversation; a run is one prompt within it. Runs carry the
+project's content revision at the moment they started, so it is always possible
+to tell which version of the data an answer was based on.
+"""
+
 import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from deep_agents_app.domain import RunContext
+from deep_agents_app.services import artifact_store
 from deep_agents_app.services import workspace as state
 from deep_agents_app.services.workspace import (
     bounded_env_int,
     create_run_context,
-    ensure_child_path,
     get_db_connection,
     get_project,
-    logger,
     prune_project_sessions,
     utc_now,
 )
@@ -24,6 +28,11 @@ def _delete_checkpoint_thread(thread_id: str) -> None:
 
 
 def session_thread_id(user_id: str, project_id: str, session_id: str) -> str:
+    """The LangGraph checkpoint thread key for a conversation.
+
+    Includes the user, project and session, so two users chatting in the same
+    project never share conversational memory.
+    """
     return f"user:{user_id}:project:{project_id}:session:{session_id}"
 
 
@@ -32,6 +41,7 @@ def create_session(
     project_id: str,
     title: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Start a conversation, pruning the user's oldest if they are at the cap."""
     get_project(project_id)
     session_id = uuid.uuid4().hex
     now = utc_now()
@@ -65,6 +75,11 @@ def create_session(
 
 
 def get_session(user_id: str, project_id: str, session_id: str) -> Dict[str, Any]:
+    """Fetch a session the caller owns, or raise 404.
+
+    The user_id predicate is the authorization check: another user's session id
+    is indistinguishable from one that does not exist.
+    """
     with get_db_connection() as conn:
         row = conn.execute(
             """
@@ -86,6 +101,7 @@ def add_chat_message(
     content: str,
     run_id: Optional[str] = None,
 ) -> None:
+    """Append a message and mark the session as recently used."""
     now = utc_now()
     with get_db_connection() as conn:
         conn.execute(
@@ -106,6 +122,7 @@ def add_chat_message(
 
 
 def maybe_title_session(user_id: str, project_id: str, session_id: str, message: str) -> None:
+    """Name an untitled conversation after its first prompt."""
     title = message.strip().replace("\n", " ")
     if len(title) > 60:
         title = title[:57].rstrip() + "..."
@@ -136,6 +153,12 @@ def create_task_run(
     session_id: str,
     prompt: str,
 ) -> Dict[str, Any]:
+    """Open a run, enforcing the concurrency limits.
+
+    Held under the project content lock so a run cannot start while project
+    content is being edited, and vice versa. Refuses a second run in the same
+    session, and more than MAX_CONCURRENT_RUNS_PER_USER across all of them.
+    """
     with state.project_content_lock(project_id):
         project = get_project(project_id)
         run_id = uuid.uuid4().hex
@@ -187,6 +210,7 @@ def create_task_run(
 
 
 def update_task_run_activity(run_id: str, message: str) -> None:
+    """Record the latest progress line, so a reconnecting UI can catch up."""
     status = message.strip()
     if not status:
         return
@@ -201,6 +225,7 @@ def update_task_run_activity(run_id: str, message: str) -> None:
 
 
 def finish_task_run(run_id: str, status: str, error_summary: Optional[str] = None) -> None:
+    """Move a run to a terminal state. Only affects a run still running."""
     if status not in {"completed", "failed", "cancelled"}:
         raise ValueError(f"Unsupported terminal run status: {status}")
     with get_db_connection() as conn:
@@ -224,24 +249,12 @@ def finish_task_run(run_id: str, status: str, error_summary: Optional[str] = Non
         )
 
 
-def cleanup_run_work(context: RunContext) -> None:
-    try:
-        work_dir = ensure_child_path(state.WORK_DIR, context.work_directory)
-        if work_dir.exists():
-            shutil.rmtree(work_dir)
-        parent = work_dir.parent
-        work_root = state.WORK_DIR.resolve()
-        while parent != work_root and work_root in parent.parents:
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-            parent = parent.parent
-    except Exception as exc:
-        logger.warning("Could not clean run work directory %s: %s", context.run_id, exc)
-
-
 def recover_interrupted_runs() -> None:
+    """Fail runs left running by a previous process.
+
+    Called at startup: a run in the database with no process behind it would
+    otherwise block its session forever.
+    """
     with get_db_connection() as conn:
         conn.execute(
             """
@@ -252,17 +265,6 @@ def recover_interrupted_runs() -> None:
             """,
             (utc_now(),),
         )
-    if not state.WORK_DIR.exists():
-        return
-    for child in state.WORK_DIR.iterdir():
-        try:
-            resolved = ensure_child_path(state.WORK_DIR, child)
-            if resolved.is_dir() and not resolved.is_symlink():
-                shutil.rmtree(resolved)
-            elif resolved.is_file() or resolved.is_symlink():
-                resolved.unlink()
-        except Exception as exc:
-            logger.warning("Could not remove orphaned work path %s: %s", child, exc)
 
 
 def delete_session_resources(
@@ -271,6 +273,11 @@ def delete_session_resources(
     session_id: str,
     thread_id: Optional[str] = None,
 ) -> None:
+    """Delete a conversation and everything it produced.
+
+    Removes artifacts from the configured store, drops the checkpoint thread,
+    and deletes the rows. Refuses while a run is still active.
+    """
     with get_db_connection() as conn:
         session = conn.execute(
             """
@@ -279,13 +286,6 @@ def delete_session_resources(
             """,
             (session_id, project_id, user_id),
         ).fetchone()
-        run_rows = conn.execute(
-            """
-            SELECT id FROM task_runs
-            WHERE session_id = ? AND project_id = ? AND user_id = ?
-            """,
-            (session_id, project_id, user_id),
-        ).fetchall()
         active_run = conn.execute(
             """
             SELECT 1 FROM task_runs
@@ -300,16 +300,7 @@ def delete_session_resources(
     if active_run:
         raise HTTPException(status_code=409, detail="A task is still running in this chat")
 
-    artifact_session_dir = ensure_child_path(
-        state.ARTIFACTS_DIR, state.ARTIFACTS_DIR / user_id / project_id / session_id
-    )
-    if artifact_session_dir.exists():
-        shutil.rmtree(artifact_session_dir)
-    for row in run_rows:
-        context = create_run_context(
-            user_id, project_id, session_id, row["id"], create=False
-        )
-        cleanup_run_work(context)
+    artifact_store.get_store().delete_prefix(f"{user_id}/{project_id}/{session_id}")
 
     _delete_checkpoint_thread(thread_id or session["thread_id"])
     with get_db_connection() as conn:
@@ -322,6 +313,7 @@ def delete_session_resources(
         )
 
 def ensure_no_active_project_runs(project_id: str) -> None:
+    """Refuse a content edit while any run in the project is executing."""
     with get_db_connection() as conn:
         row = conn.execute(
             """

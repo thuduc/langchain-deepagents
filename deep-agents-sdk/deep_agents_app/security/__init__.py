@@ -1,3 +1,5 @@
+"""Identity decoding and the single role this application authorizes on."""
+
 from .identity import (
     AuthenticationError,
     PROJECT_ADMIN_ROLE,

@@ -1,3 +1,5 @@
+"""Read-side queries that compose repository rows into API responses."""
+
 from typing import Any, Dict, List
 
 from deep_agents_app.repositories import projects as project_repository
@@ -6,18 +8,26 @@ from deep_agents_app.services import workspace
 
 
 def list_projects():
+    """Every active project. Projects are shared, so this is not user-scoped."""
     with workspace.get_db_connection() as connection:
         rows = project_repository.list_active(connection)
     return [workspace.public_project(workspace.row_to_project(row)) for row in rows]
 
 
 def rename_project(project_id: str, name: str):
+    """Rename a project without touching its content revision or its files."""
     with workspace.get_db_connection() as connection:
         row = project_repository.update_name(connection, project_id, name, workspace.utc_now())
     return workspace.public_project(workspace.row_to_project(row))
 
 
 def session_detail(user_id: str, project_id: str, session_id: str):
+    """One conversation, with artifact links restored into each stored answer.
+
+    Assistant messages are re-rendered on read rather than stored with links
+    baked in, so an artifact deleted since the answer was written stops being
+    offered. Run timings are folded in for the UI.
+    """
     session = workspace.get_session(user_id, project_id, session_id)
     with workspace.get_db_connection() as connection:
         rows = session_repository.messages(connection, user_id, project_id, session_id)
@@ -44,11 +54,13 @@ def session_detail(user_id: str, project_id: str, session_id: str):
 
 
 def session_runs(user_id: str, project_id: str, session_id: str):
+    """Run history for a session. Ownership is checked before anything is read."""
     workspace.get_session(user_id, project_id, session_id)
     with workspace.get_db_connection() as connection:
         return [dict(row) for row in session_repository.runs(connection, user_id, project_id, session_id)]
 
 
 def owned_artifact(artifact_id: str, user_id: str):
+    """Look up an artifact, matching on owner so another user's id returns None."""
     with workspace.get_db_connection() as connection:
         return session_repository.artifact_by_owner(connection, artifact_id, user_id)

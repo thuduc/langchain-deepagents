@@ -1,3 +1,11 @@
+"""Database schema and startup migrations.
+
+Ownership is expressed in the tables themselves: chat_sessions, task_runs,
+chat_messages and artifacts all carry user_id and cascade on delete, so removing
+a user or a session takes their private data with it. Projects carry no user_id
+because project content is shared.
+"""
+
 import sqlite3
 
 
@@ -81,6 +89,12 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_owner_run
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
+    """Create the schema if absent and apply in-place migrations.
+
+    Runs on every startup and is idempotent. Columns added after the first
+    release are patched in explicitly, because CREATE TABLE IF NOT EXISTS will
+    not alter a table that already exists.
+    """
     connection.executescript(SCHEMA_SQL)
     task_run_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(task_runs)").fetchall()

@@ -1,3 +1,11 @@
+"""Project endpoints: metadata, the content explorer, and imports.
+
+Project content is shared by every user, so reads require only a valid
+identity while anything that mutates content requires PROJECT_ADMIN. That
+split is visible in each route's dependency: `get_current_user` for reads,
+`require_project_admin` for writes.
+"""
+
 import shutil
 import uuid
 from pathlib import Path
@@ -44,11 +52,13 @@ async def _stage_content_upload(file: UploadFile, user_id: str) -> tuple[Path, s
 
 @router.get("/projects")
 def list_projects(_: CurrentUser = Depends(get_current_user)):
+    """Every project. Shared content, so not filtered by user."""
     return {"projects": queries.list_projects()}
 
 
 @router.post("/projects")
 def create_project(request: ProjectCreateRequest, user: CurrentUser = Depends(require_project_admin)):
+    """Create an empty project and its directory. Administrators only."""
     project = workspace.create_project_record(request.name, user.id)
     workspace.validate_project_skills(project["id"])
     workspace.add_audit_event(user.id, "project.create", project["id"], {"name": project["name"]})
@@ -57,6 +67,7 @@ def create_project(request: ProjectCreateRequest, user: CurrentUser = Depends(re
 
 @router.put("/projects/{project_id}")
 def update_project(project_id: str, request: ProjectUpdateRequest, user: CurrentUser = Depends(require_project_admin)):
+    """Rename a project. Invalidates the cached agent, whose prompt names it."""
     workspace.get_project(project_id)
     name = request.name.strip()
     if not name:
@@ -69,6 +80,7 @@ def update_project(project_id: str, request: ProjectUpdateRequest, user: Current
 
 @router.get("/projects/{project_id}")
 def get_project(project_id: str, _: CurrentUser = Depends(get_current_user)):
+    """One project with its discovered skills."""
     project = workspace.get_project(project_id)
     project["skills"] = workspace.scan_project_skills(project_id)
     return {"project": workspace.public_project(project)}
@@ -76,11 +88,22 @@ def get_project(project_id: str, _: CurrentUser = Depends(get_current_user)):
 
 @router.get("/projects/{project_id}/isolation")
 def project_isolation(project_id: str, user: CurrentUser = Depends(require_project_admin)):
+    """Diagnostics confirming the isolation invariants still hold.
+
+    Intended as a production smoke test: it reports which sandbox backend is
+    active and re-checks that project, skill and artifact paths are scoped as
+    expected.
+    """
     return {"audit": workspace.project_isolation_audit(user.id, project_id)}
 
 
 @router.delete("/projects/{project_id}")
 def delete_project(project_id: str, user: CurrentUser = Depends(require_project_admin)):
+    """Delete a project and everything owned by it.
+
+    The audit event is written before the deletion, so the intent survives even
+    if the removal itself fails partway.
+    """
     project = workspace.get_project(project_id)
     project_root = workspace.ensure_child_path(workspace.get_projects_dir(), Path(project["path"]))
     workspace.add_audit_event(user.id, "project.delete.requested", project_id, {"name": project["name"]})
@@ -90,6 +113,7 @@ def delete_project(project_id: str, user: CurrentUser = Depends(require_project_
 
 @router.get("/projects/{project_id}/contents")
 def project_contents(project_id: str, _: CurrentUser = Depends(get_current_user)):
+    """Flat listing of a project's files, used by the agent's file picker."""
     return {"items": workspace.list_project_files(workspace.get_project_root(project_id))}
 
 
@@ -99,6 +123,7 @@ def project_directory(
     path: str = "",
     _: CurrentUser = Depends(get_current_user),
 ):
+    """One directory level, for lazy expansion in the file explorer."""
     return project_files.list_directory(project_id, path)
 
 
@@ -108,6 +133,7 @@ def project_file_search(
     query: str = "",
     _: CurrentUser = Depends(get_current_user),
 ):
+    """Find files by name within a project."""
     return project_files.search_files(project_id, query)
 
 
@@ -117,6 +143,7 @@ def project_file_preview(
     path: str,
     _: CurrentUser = Depends(get_current_user),
 ):
+    """A renderable preview: text excerpt, parsed table, or file metadata."""
     return project_files.preview_file(project_id, path)
 
 
@@ -126,6 +153,7 @@ def project_file_inline(
     path: str,
     _: CurrentUser = Depends(get_current_user),
 ):
+    """Serve a file for display in the browser rather than download."""
     file_path, media_type = project_files.inline_file(project_id, path)
     return FileResponse(
         file_path,
@@ -141,6 +169,7 @@ def project_file_download(
     path: str,
     _: CurrentUser = Depends(get_current_user),
 ):
+    """Serve a project file as an attachment."""
     file_path, media_type = project_files.download_file(project_id, path)
     return FileResponse(
         file_path,
@@ -156,6 +185,7 @@ def project_entry_info(
     path: str,
     _: CurrentUser = Depends(get_current_user),
 ):
+    """Type, size and timestamps for one file or folder."""
     return project_files.entry_info(project_id, path)
 
 
@@ -164,6 +194,7 @@ def project_content_summary(
     project_id: str,
     _: CurrentUser = Depends(get_current_user),
 ):
+    """Counts and total size, shown before destructive actions."""
     return project_files.content_summary(project_id)
 
 
@@ -172,6 +203,11 @@ def export_project(
     project_id: str,
     user: CurrentUser = Depends(get_current_user),
 ):
+    """Download the whole project as a ZIP.
+
+    The archive is built to a temporary file and deleted after the response is
+    sent, so a large export never accumulates on disk.
+    """
     archive_path, download_name = project_files.export_project_archive(project_id, user.id)
     try:
         workspace.add_audit_event(
@@ -197,6 +233,7 @@ def create_project_folder(
     request: ProjectFolderCreateRequest,
     user: CurrentUser = Depends(require_project_admin),
 ):
+    """Create a folder inside a project. Administrators only."""
     return project_files.create_folder(project_id, request.parent_path, request.name, user.id)
 
 
@@ -207,6 +244,11 @@ async def add_project_file(
     parent_path: str = "",
     user: CurrentUser = Depends(require_project_admin),
 ):
+    """Upload a file into a project. Administrators only.
+
+    Staged to a temporary file first and removed in a finally block, so a
+    rejected or failed upload leaves nothing behind.
+    """
     staged, file_name = await _stage_content_upload(file, user.id)
     try:
         return await run_in_threadpool(
@@ -228,6 +270,7 @@ async def replace_project_file(
     file: UploadFile = File(...),
     user: CurrentUser = Depends(require_project_admin),
 ):
+    """Overwrite an existing project file. Administrators only."""
     staged, file_name = await _stage_content_upload(file, user.id)
     try:
         return await run_in_threadpool(
@@ -248,11 +291,17 @@ def delete_project_entry(
     path: str,
     user: CurrentUser = Depends(require_project_admin),
 ):
+    """Delete one file or folder. Administrators only."""
     return project_files.delete_entry(project_id, path, user.id)
 
 
 @router.delete("/projects/{project_id}/contents")
 def delete_project_contents(project_id: str, user: CurrentUser = Depends(require_project_admin)):
+    """Empty a project without deleting the project itself.
+
+    Refused while any run is active, since generated code may be reading the
+    files that are about to disappear.
+    """
     workspace.ensure_no_active_project_runs(project_id)
     project_root = workspace.get_project_root(project_id)
     workspace.reset_project_contents_transactional(project_root)
@@ -264,6 +313,11 @@ def delete_project_contents(project_id: str, user: CurrentUser = Depends(require
 
 @router.post("/uploads/preview")
 async def upload_preview(file: UploadFile = File(...), user: CurrentUser = Depends(require_project_admin)):
+    """Inspect a ZIP before importing it, returning a single-use token.
+
+    Lets an administrator see what an import would do before committing to it.
+    The token is bound to the uploader and expires.
+    """
     token = uuid.uuid4().hex
     user_dir = workspace.ensure_child_path(workspace.TMP_UPLOADS_DIR, workspace.TMP_UPLOADS_DIR / user.id)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -286,6 +340,7 @@ async def upload_preview(file: UploadFile = File(...), user: CurrentUser = Depen
 
 @router.post("/projects/import")
 def import_project(request: ProjectImportRequest, user: CurrentUser = Depends(require_project_admin)):
+    """Create a project from a previously uploaded ZIP. Administrators only."""
     zip_path = workspace.upload_path_for_token(user.id, request.upload_token, consume=True)
     project: Optional[Dict[str, Any]] = None
     try:
@@ -310,6 +365,7 @@ def import_project(request: ProjectImportRequest, user: CurrentUser = Depends(re
 
 @router.post("/projects/{project_id}/contents/import")
 def import_project_contents(project_id: str, request: ContentImportRequest, user: CurrentUser = Depends(require_project_admin)):
+    """Merge or replace an existing project's content from a ZIP."""
     with workspace.project_content_lock(project_id):
         workspace.ensure_no_active_project_runs(project_id)
         project_root = workspace.get_project_root(project_id)
@@ -327,6 +383,7 @@ def import_project_contents(project_id: str, request: ContentImportRequest, user
 
 @router.get("/projects/{project_id}/media/{media_path:path}")
 def project_media(project_id: str, media_path: str, _: CurrentUser = Depends(get_current_user)):
+    """Serve an image or other media file referenced from an answer."""
     project_root = workspace.get_project_root(project_id)
     file_path = workspace.relative_project_path(project_root, media_path)
     if file_path.suffix.lower() not in workspace.MEDIA_EXTENSIONS or not file_path.is_file():

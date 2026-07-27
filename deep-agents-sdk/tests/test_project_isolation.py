@@ -18,16 +18,32 @@ if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
 from deep_agents_app import application  # noqa: E402
+from deep_agents_app.runtime import sandbox  # noqa: E402
+from deep_agents_app.services import artifact_store  # noqa: E402
 from deep_agents_app.services import workspace as server  # noqa: E402
 
 
 class MultiUserIsolationTests(unittest.TestCase):
     def setUp(self):
+        # Pin the sandbox backend so the suite never reaches AWS, whatever .env
+        # happens to say on the machine running it.
+        sandbox_env = patch.dict(
+            os.environ,
+            {"DEEP_AGENTS_SANDBOX": "local", "DEEP_AGENTS_ARTIFACT_STORE": "local"},
+        )
+        sandbox_env.start()
+        self.addCleanup(sandbox_env.stop)
+        sandbox.reset_backend()
+        self.addCleanup(sandbox.reset_backend)
+        # The local store captures ARTIFACTS_DIR, which this suite repoints per test.
+        artifact_store.reset_store()
+        self.addCleanup(artifact_store.reset_store)
+
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="deep-agents-test-"))
         self.originals = {
             "DB_PATH": server.DB_PATH,
             "AGENT_CHECKPOINT_DB_PATH": server.AGENT_CHECKPOINT_DB_PATH,
-            "WORK_DIR": server.WORK_DIR,
+            "SANDBOX_DIR": server.SANDBOX_DIR,
             "ARTIFACTS_DIR": server.ARTIFACTS_DIR,
             "TMP_UPLOADS_DIR": server.TMP_UPLOADS_DIR,
             "PROJECTS_ROOT": server.PROJECTS_ROOT,
@@ -36,12 +52,12 @@ class MultiUserIsolationTests(unittest.TestCase):
         }
         server.DB_PATH = self.tmp_dir / "databases" / "app.db"
         server.AGENT_CHECKPOINT_DB_PATH = self.tmp_dir / "databases" / "agent.db"
-        server.WORK_DIR = self.tmp_dir / "generated" / "work"
+        server.SANDBOX_DIR = self.tmp_dir / "generated" / "sandbox"
         server.ARTIFACTS_DIR = self.tmp_dir / "generated" / "artifacts"
         server.TMP_UPLOADS_DIR = self.tmp_dir / "generated" / "uploads"
         server.PROJECTS_ROOT = self.tmp_dir / "projects"
         for path in (
-            server.WORK_DIR,
+            server.SANDBOX_DIR,
             server.ARTIFACTS_DIR,
             server.TMP_UPLOADS_DIR,
             server.PROJECTS_ROOT,
@@ -528,7 +544,6 @@ class MultiUserIsolationTests(unittest.TestCase):
             self.assertFalse(server.get_project_root("hpi-analytics").joinpath("data/blocked").exists())
         finally:
             server.finish_task_run(run["id"], "completed")
-            server.cleanup_run_work(run["context"])
 
     def test_only_project_admin_can_mutate_projects_and_settings(self):
         denied = self.client.post(
@@ -657,7 +672,6 @@ class MultiUserIsolationTests(unittest.TestCase):
         )
 
         server.finish_task_run(run["id"], "completed")
-        server.cleanup_run_work(run["context"])
 
     def test_agent_events_have_user_facing_activity_statuses(self):
         self.assertEqual(
@@ -671,15 +685,12 @@ class MultiUserIsolationTests(unittest.TestCase):
             "A project specialist is working with the data…",
         )
 
-    def test_startup_recovery_fails_interrupted_runs_and_cleans_work(self):
+    def test_startup_recovery_fails_interrupted_runs(self):
         user_id = self._user_id(self.user1_headers)
         session = server.create_session(user_id, "hpi-analytics", "Interrupted")
         run = server.create_task_run(
             user_id, "hpi-analytics", session["id"], "unfinished work"
         )
-        work_file = run["context"].work_directory / "partial.py"
-        work_file.write_text("print('partial')\n", encoding="utf-8")
-
         server.recover_interrupted_runs()
 
         with server.get_db_connection() as conn:
@@ -689,7 +700,6 @@ class MultiUserIsolationTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["error_summary"], "Server restarted during the run")
-        self.assertFalse(run["context"].work_directory.exists())
 
     def test_session_limit_is_per_user_and_project(self):
         user1_id = self._user_id(self.user1_headers)
@@ -714,8 +724,6 @@ class MultiUserIsolationTests(unittest.TestCase):
             user1_id, "hpi-analytics", session["id"], "create chart"
         )
         context = run["context"]
-        work_path = context.work_directory / "generated.py"
-        work_path.write_text("print('temporary')\n", encoding="utf-8")
         artifact_path = context.artifact_directory / "chart.png"
         artifact_path.write_bytes(b"not-a-real-png")
         artifact = server.register_run_artifacts(context)[0]
@@ -748,7 +756,6 @@ class MultiUserIsolationTests(unittest.TestCase):
         )
         self.assertEqual(deleted.status_code, 200)
         self.assertFalse(artifact_path.exists())
-        self.assertFalse(work_path.exists())
         with server.get_db_connection() as conn:
             session_count = conn.execute(
                 "SELECT COUNT(*) AS count FROM chat_sessions WHERE id = ?",
@@ -780,8 +787,7 @@ source = Path("data/input.csv").read_text(encoding="utf-8")
 output = Path("outputs/result.json")
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps({"source": source.strip()}), encoding="utf-8")
-direct = Path(os.environ["DEEP_AGENTS_RUN_ARTIFACT_DIR"]) / "direct.txt"
-direct.write_text(os.environ["DEEP_AGENTS_PROJECT_DIR"], encoding="utf-8")
+Path("out/direct.txt").write_text("direct", encoding="utf-8")
 print(output)
 """
         token = server.CURRENT_RUN_CONTEXT.set(context)
@@ -801,11 +807,10 @@ print(output)
         self.assertEqual(artifact_names, {"direct.txt", "result.json"})
         self.assertTrue((context.artifact_directory / "outputs" / "result.json").is_file())
         self.assertTrue((context.artifact_directory / "direct.txt").is_file())
-        self.assertFalse((context.work_directory / "outputs" / "result.json").exists())
         self.assertEqual(
-            context.work_directory,
+            context.artifact_directory,
             (
-                server.WORK_DIR
+                server.ARTIFACTS_DIR
                 / user_id
                 / "nmdb-analytics"
                 / session["id"]
@@ -820,11 +825,12 @@ print(output)
             user_id, "hpi-analytics", session["id"], "create output"
         )
         context = run["context"]
-        code = """
-import os
+        # Only the local backend can reach the project tree at all; production
+        # runs in a microVM with no filesystem path to it.
+        code = f"""
 from pathlib import Path
 
-output = Path(os.environ["DEEP_AGENTS_PROJECT_DIR"]) / "outputs" / "chart.txt"
+output = Path({str(server.get_project_root("hpi-analytics"))!r}) / "outputs" / "chart.txt"
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text("chart", encoding="utf-8")
 """
@@ -907,7 +913,7 @@ output.write_text("chart", encoding="utf-8")
             user_id, "nmdb-analytics", session["id"], "create relative export"
         )
         context = run["context"]
-        relative_output = context.work_directory / "outputs" / "result.csv"
+        relative_output = context.artifact_directory / "outputs" / "result.csv"
         relative_output.parent.mkdir(parents=True)
         relative_output.write_text("value\n42\n", encoding="utf-8")
         artifacts = server.register_run_artifacts(context)

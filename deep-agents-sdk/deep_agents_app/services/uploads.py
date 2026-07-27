@@ -1,3 +1,11 @@
+"""ZIP upload previews and safe extraction.
+
+An administrator uploads an archive, inspects what it contains, then imports it
+with a single-use token. Extraction is the security-sensitive part: archives are
+untrusted input, so entries that escape the target directory or are symlinks are
+rejected rather than written.
+"""
+
 import hashlib
 import re
 import shutil
@@ -22,10 +30,12 @@ from deep_agents_app.services.workspace import (
 
 
 def upload_token_hash(token: str) -> str:
+    """Hash a token for storage, so the database never holds the usable value."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def prune_expired_uploads() -> None:
+    """Delete expired or consumed previews and their staged archives."""
     try:
         with get_db_connection() as conn:
             rows = conn.execute(
@@ -49,6 +59,11 @@ def prune_expired_uploads() -> None:
 
 
 def upload_path_for_token(user_id: str, token: str, consume: bool = False) -> Path:
+    """Resolve a preview token to its archive, optionally consuming it.
+
+    Consuming marks the token used inside the same transaction that reads it, so
+    two concurrent imports cannot both claim one upload.
+    """
     if not re.fullmatch(r"[a-f0-9]{32}", token):
         raise HTTPException(status_code=400, detail="Invalid upload token")
     token_hash = upload_token_hash(token)
@@ -79,6 +94,7 @@ def upload_path_for_token(user_id: str, token: str, consume: bool = False) -> Pa
 
 
 def record_upload_preview(user_id: str, token: str, zip_path: Path) -> None:
+    """Register a staged archive against a single-use, expiring token."""
     ttl_minutes = bounded_env_int("UPLOAD_PREVIEW_TTL_MINUTES", 15, 1, 1440)
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
     storage_key = zip_path.resolve().relative_to(state.TMP_UPLOADS_DIR.resolve()).as_posix()
@@ -94,11 +110,13 @@ def record_upload_preview(user_id: str, token: str, zip_path: Path) -> None:
 
 
 def is_zip_symlink(info: zipfile.ZipInfo) -> bool:
+    """Whether an archive entry is a symlink, which is never extracted."""
     mode = info.external_attr >> 16
     return (mode & 0o170000) == 0o120000
 
 
 def inspect_zip(zip_path: Path) -> Dict[str, Any]:
+    """Summarise an archive's contents without extracting it."""
     entries: List[Dict[str, Any]] = []
     total_size = 0
 
@@ -141,6 +159,11 @@ def inspect_zip(zip_path: Path) -> Dict[str, Any]:
 
 
 def extract_zip_contents(zip_path: Path, target_dir: Path) -> None:
+    """Extract entries, refusing anything that escapes the target directory.
+
+    Guards against path traversal ('../') and symlink entries, both of which
+    would otherwise let an archive write outside the project.
+    """
     with zipfile.ZipFile(zip_path) as archive:
         for info in archive.infolist():
             name = info.filename.replace("\\", "/")
@@ -159,6 +182,11 @@ def extract_zip_contents(zip_path: Path, target_dir: Path) -> None:
 
 
 def extract_zip(zip_path: Path, target_dir: Path, mode: str) -> None:
+    """Extract in 'merge' or 'replace' mode.
+
+    Replace builds the new tree beside the old one and swaps it into place, so a
+    failure part-way leaves the existing content untouched.
+    """
     if mode not in {"merge", "replace"}:
         raise HTTPException(status_code=400, detail="Import mode must be 'merge' or 'replace'")
 
@@ -193,6 +221,7 @@ def extract_zip(zip_path: Path, target_dir: Path, mode: str) -> None:
             shutil.rmtree(staging_dir)
 
 def cleanup_upload_preview(token: str, zip_path: Path) -> None:
+    """Remove a preview and its archive once the import is finished."""
     zip_path.unlink(missing_ok=True)
     with get_db_connection() as conn:
         conn.execute(

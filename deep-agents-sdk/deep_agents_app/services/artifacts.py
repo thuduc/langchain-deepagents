@@ -1,6 +1,13 @@
+"""Registering generated files and rendering them into answers.
+
+Two jobs. Registration takes what the sandbox collected, hands it to the artifact
+store, and records a row per file. Rendering rewrites an answer so those files
+appear as authenticated links, and strips the internal paths a model may have
+mentioned, so no server location ever reaches the browser.
+"""
+
 import mimetypes
 import re
-import shutil
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
@@ -9,6 +16,7 @@ from urllib.parse import quote
 from fastapi import HTTPException
 
 from deep_agents_app.domain import RunContext
+from deep_agents_app.services import artifact_store
 from deep_agents_app.services import workspace as state
 from deep_agents_app.services.workspace import (
     AUDIO_EXTENSIONS,
@@ -29,6 +37,7 @@ from deep_agents_app.services.workspace import (
 
 
 def strip_media_reference(raw_path: str) -> str:
+    """Trim quoting and trailing punctuation from a path a model wrote."""
     cleaned = raw_path.strip().strip("`'\"")
     while cleaned and cleaned[-1] in ".,;:)":
         cleaned = cleaned[:-1]
@@ -36,6 +45,7 @@ def strip_media_reference(raw_path: str) -> str:
 
 
 def project_media_url(user_id: str, project_id: str, file_path: Path) -> Optional[str]:
+    """Map a filesystem path to the URL that serves it, if any."""
     project_root = get_project_root(project_id)
     resolved = file_path.resolve()
 
@@ -68,6 +78,7 @@ def resolve_media_reference(
     project_id: str,
     raw_path: str,
 ) -> Optional[Dict[str, str]]:
+    """Resolve a path mentioned in an answer to a servable media URL."""
     cleaned = strip_media_reference(raw_path)
     if not cleaned:
         return None
@@ -97,6 +108,7 @@ def resolve_media_reference(
 
 
 def media_embed_markdown(media: Dict[str, str]) -> str:
+    """Render a media URL as an inline image, video, audio or link."""
     suffix = media["suffix"]
     url = media["url"]
     if suffix in IMAGE_EXTENSIONS:
@@ -109,6 +121,7 @@ def media_embed_markdown(media: Dict[str, str]) -> str:
 
 
 def line_without_media_paths(line: str, paths: List[str]) -> str:
+    """What remains of a line once the file paths are removed."""
     remainder = line
     for path in paths:
         remainder = remainder.replace(path, "")
@@ -116,6 +129,7 @@ def line_without_media_paths(line: str, paths: List[str]) -> str:
 
 
 def media_urls_already_embedded(user_id: str, project_id: str, line: str) -> set[str]:
+    """URLs a line already embeds, so they are not duplicated."""
     urls: set[str] = set()
     for match in MARKDOWN_IMAGE_RE.finditer(line):
         media = resolve_media_reference(user_id, project_id, match.group("href"))
@@ -127,12 +141,14 @@ def media_urls_already_embedded(user_id: str, project_id: str, line: str) -> set
 
 
 def embedded_media_spans(line: str) -> List[tuple[int, int]]:
+    """Character ranges already inside a markdown or HTML embed."""
     spans = [match.span() for match in MARKDOWN_IMAGE_RE.finditer(line)]
     spans.extend(match.span() for match in HTML_MEDIA_SRC_RE.finditer(line))
     return spans
 
 
 def span_inside_any(start: int, end: int, spans: List[tuple[int, int]]) -> bool:
+    """Whether a match falls inside an existing embed."""
     return any(span_start <= start and end <= span_end for span_start, span_end in spans)
 
 
@@ -210,51 +226,13 @@ def normalize_project_media_links(user_id: str, project_id: str, text: str) -> s
     return "\n".join(output)
 
 
-RUN_WORK_INTERNAL_NAMES = {
-    ".matplotlib",
-    ".python-cache",
-    "__pycache__",
-    "generated.py",
-}
-
-
-def unique_artifact_path(artifact_root: Path, relative_path: Path) -> Path:
-    target = ensure_child_path(artifact_root, artifact_root / relative_path)
-    if not target.exists():
-        return target
-    for sequence in range(2, 10_000):
-        candidate = target.with_name(f"{target.stem}-{sequence}{target.suffix}")
-        candidate = ensure_child_path(artifact_root, candidate)
-        if not candidate.exists():
-            return candidate
-    raise RuntimeError(f"Could not allocate a unique artifact name for {relative_path}")
-
-
-def collect_run_work_artifacts(context: RunContext) -> List[Path]:
-    """Move generated workspace files into the run's retained artifact directory."""
-    work_directory = ensure_child_path(state.WORK_DIR, context.work_directory)
-    artifact_directory = ensure_child_path(state.ARTIFACTS_DIR, context.artifact_directory)
-    if not work_directory.exists():
-        return []
-
-    artifact_directory.mkdir(parents=True, exist_ok=True)
-    collected: List[Path] = []
-    for path in sorted(work_directory.rglob("*")):
-        if path.is_symlink() or not path.is_file():
-            continue
-        relative_path = path.relative_to(work_directory)
-        if any(part in RUN_WORK_INTERNAL_NAMES for part in relative_path.parts):
-            continue
-        target = unique_artifact_path(artifact_directory, relative_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), str(target))
-        collected.append(target)
-    return collected
-
-
 def register_run_artifacts(context: RunContext) -> List[Dict[str, Any]]:
+    """Record everything the run produced and hand it to the store.
+
+    The store takes ownership of each file before its row is written, so an
+    artifact row can never point at bytes that were not persisted.
+    """
     artifacts: List[Dict[str, Any]] = []
-    collect_run_work_artifacts(context)
     if not context.artifact_directory.exists():
         return artifacts
     for path in sorted(context.artifact_directory.rglob("*")):
@@ -273,6 +251,9 @@ def register_run_artifacts(context: RunContext) -> List[Dict[str, Any]]:
             if existing:
                 artifacts.append(dict(existing))
                 continue
+            # Hand the file to the store before recording it, so a row never
+            # points at bytes that were never persisted.
+            artifact_store.get_store().put(storage_key, path)
             conn.execute(
                 """
                 INSERT INTO artifacts (
@@ -306,6 +287,7 @@ def register_run_artifacts(context: RunContext) -> List[Dict[str, Any]]:
 
 
 def append_artifact_links(text: str, artifacts: List[Dict[str, Any]]) -> str:
+    """Add a Generated artifacts section for files not already linked."""
     links: List[str] = []
     for artifact in artifacts:
         url = f"/api/artifacts/{artifact['id']}"
@@ -323,6 +305,7 @@ def append_artifact_links(text: str, artifacts: List[Dict[str, Any]]) -> str:
 
 
 def artifact_path_variants(artifact: Dict[str, Any]) -> List[str]:
+    """The spellings of an artifact's path a model might have written."""
     storage_key = str(artifact.get("storage_key", "")).strip()
     if not storage_key:
         return []
@@ -338,15 +321,14 @@ def artifact_path_variants(artifact: Dict[str, Any]) -> List[str]:
         pass
     storage_parts = PurePosixPath(storage_key).parts
     if len(storage_parts) >= 5:
-        run_relative_path = Path(*storage_parts[4:])
-        variants.add(run_relative_path.as_posix())
-        work_path = state.WORK_DIR.joinpath(*storage_parts[:4], run_relative_path)
-        variants.update({str(work_path), work_path.as_posix()})
+        # The relative form is what a model would echo, e.g. 'outputs/result.csv'.
+        variants.add(Path(*storage_parts[4:]).as_posix())
     variants.update(f"file://{value}" for value in list(variants) if value.startswith("/"))
     return sorted(variants, key=len, reverse=True)
 
 
 def artifact_label_only(line: str, artifacts: List[Dict[str, Any]]) -> bool:
+    """Whether a line is just a label for an artifact, with no content."""
     plain = re.sub(r"^[\s#>*_`-]+|[\s*_`]+$", "", line).strip()
     if not plain:
         return True
@@ -406,6 +388,7 @@ ARTIFACT_ANNOUNCEMENT_WORDS = {
 
 
 def artifact_placeholder_line(line: str, artifacts: List[Dict[str, Any]]) -> bool:
+    """Whether a line is an empty placeholder left where a file was named."""
     plain = re.sub(r"^[\s#>*_`-]+|[\s*_`]+$", "", line).strip()
     if not plain or re.fullmatch(r"[-*_]{3,}", plain):
         return True
@@ -460,6 +443,7 @@ VISUAL_ARTIFACT_HEADING_RE = re.compile(
 
 
 def artifact_is_referenced(text: str, artifact: Dict[str, Any]) -> bool:
+    """Whether the answer already refers to this artifact."""
     artifact_id = str(artifact.get("id", "")).strip()
     if artifact_id and f"/api/artifacts/{artifact_id}" in text:
         return True
@@ -570,6 +554,11 @@ def prepare_response_artifacts(
     text: str,
     artifacts: List[Dict[str, Any]],
 ) -> str:
+    """Turn a raw answer into what the user sees.
+
+    Selects the artifacts worth attaching, strips internal paths, converts file
+    references into authenticated links, and appends anything not yet linked.
+    """
     response_artifacts = select_response_artifacts(text, artifacts)
     sanitized = strip_internal_artifact_paths(text, artifacts)
     normalized = normalize_project_media_links(user_id, project_id, sanitized)

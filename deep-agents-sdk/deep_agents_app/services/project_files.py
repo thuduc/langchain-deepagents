@@ -179,6 +179,7 @@ def _commit_mutation(
 
 
 def create_folder(project_id: str, parent_path: str, name: str, user_id: str) -> Dict[str, Any]:
+    """Create a folder inside a project."""
     with workspace.project_content_lock(project_id):
         workspace.ensure_no_active_project_runs(project_id)
         root, parent, target = _new_child_path(project_id, parent_path, name)
@@ -209,6 +210,7 @@ def add_file_from_staged(
     staged_upload: Path,
     user_id: str,
 ) -> Dict[str, Any]:
+    """Move an uploaded file into a project, validating skills if it is one."""
     with workspace.project_content_lock(project_id):
         workspace.ensure_no_active_project_runs(project_id)
         root, parent, target = _new_child_path(project_id, parent_path, file_name)
@@ -243,6 +245,7 @@ def replace_file_from_staged(
     staged_upload: Path,
     user_id: str,
 ) -> Dict[str, Any]:
+    """Overwrite an existing project file with an uploaded one."""
     with workspace.project_content_lock(project_id):
         workspace.ensure_no_active_project_runs(project_id)
         root, target = resolve_project_path(project_id, user_path, expected="file")
@@ -283,6 +286,7 @@ def replace_file_from_staged(
 
 
 def entry_info(project_id: str, user_path: str) -> Dict[str, Any]:
+    """Type, size and timestamps for one entry."""
     root, target = resolve_project_path(project_id, user_path)
     if target == root:
         raise HTTPException(status_code=400, detail="The project root cannot be changed")
@@ -306,6 +310,7 @@ def entry_info(project_id: str, user_path: str) -> Dict[str, Any]:
 
 
 def content_summary(project_id: str) -> Dict[str, Any]:
+    """File count and total size, shown before destructive actions."""
     root = workspace.get_project_root(project_id)
     file_count = 0
     folder_count = 0
@@ -342,6 +347,7 @@ def content_summary(project_id: str) -> Dict[str, Any]:
 
 
 def export_project_archive(project_id: str, user_id: str) -> tuple[Path, str]:
+    """Build a ZIP of a project and return its path and download name."""
     with workspace.project_content_lock(project_id):
         project = workspace.get_project(project_id)
         root = workspace.get_project_root(project_id)
@@ -382,6 +388,11 @@ def export_project_archive(project_id: str, user_id: str) -> tuple[Path, str]:
 
 
 def delete_entry(project_id: str, user_path: str, user_id: str) -> Dict[str, Any]:
+    """Delete a file or folder.
+
+    Renames the target aside first, so the deletion can be rolled back if
+    recording it fails.
+    """
     with workspace.project_content_lock(project_id):
         workspace.ensure_no_active_project_runs(project_id)
         root, target = resolve_project_path(project_id, user_path)
@@ -426,6 +437,7 @@ def _has_visible_children(path: Path) -> bool:
 
 
 def file_item(root: Path, path: Path) -> Dict[str, Any]:
+    """Describe one entry for the explorer."""
     is_directory = path.is_dir()
     result: Dict[str, Any] = {
         "path": path.relative_to(root).as_posix(),
@@ -442,6 +454,7 @@ def file_item(root: Path, path: Path) -> Dict[str, Any]:
 
 
 def list_directory(project_id: str, user_path: str) -> Dict[str, Any]:
+    """One directory level, sorted folders first."""
     root, directory = resolve_project_path(project_id, user_path, expected="directory")
     try:
         children = [
@@ -461,6 +474,7 @@ def list_directory(project_id: str, user_path: str) -> Dict[str, Any]:
 
 
 def search_files(project_id: str, query: str) -> Dict[str, Any]:
+    """Find entries whose name matches a query."""
     root = workspace.get_project_root(project_id)
     needle = query.strip().casefold()
     if len(needle) < 2:
@@ -560,6 +574,11 @@ def _csv_preview(path: Path) -> Dict[str, Any]:
 
 
 def preview_file(project_id: str, user_path: str) -> Dict[str, Any]:
+    """A renderable preview, chosen by file type.
+
+    Tabular files are parsed into rows, text is excerpted, and anything else
+    returns metadata only, so a large binary is never loaded to be displayed.
+    """
     root, path = resolve_project_path(project_id, user_path, expected="file")
     item = file_item(root, path)
     mime_type = item["mime_type"]
@@ -587,6 +606,7 @@ def preview_file(project_id: str, user_path: str) -> Dict[str, Any]:
 
 
 def inline_file(project_id: str, user_path: str) -> tuple[Path, str]:
+    """Resolve a file for inline display, with its media type."""
     _, path = resolve_project_path(project_id, user_path, expected="file")
     mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     kind, _ = _preview_kind(path, mime_type)
@@ -596,5 +616,6 @@ def inline_file(project_id: str, user_path: str) -> tuple[Path, str]:
 
 
 def download_file(project_id: str, user_path: str) -> tuple[Path, str]:
+    """Resolve a file for download, with its media type."""
     _, path = resolve_project_path(project_id, user_path, expected="file")
     return path, mimetypes.guess_type(path.name)[0] or "application/octet-stream"

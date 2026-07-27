@@ -1,3 +1,5 @@
+"""Chat endpoints: one blocking, one streaming. Both run the same agent."""
+
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -5,6 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from deep_agents_app.api.dependencies import get_current_user
 from deep_agents_app.domain import CurrentUser, RunContext
+from deep_agents_app.runtime import sandbox_runs
 from deep_agents_app.schemas import ChatRequest, ChatResponse
 from deep_agents_app.services import workspace
 
@@ -13,6 +16,13 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
 def prepare_run(request: ChatRequest, user: CurrentUser):
+    """Validate a chat request and open a run for it.
+
+    Both chat routes share this. It is also the authorization gate: passing
+    another user's session_id fails here, because get_session matches on the
+    caller's id. Every value later used to scope the sandbox and its storage
+    comes from what this function returns, never from the request body.
+    """
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     if len(request.message) > 100_000:
@@ -31,6 +41,11 @@ def prepare_run(request: ChatRequest, user: CurrentUser):
 
 @router.post("", response_model=ChatResponse)
 def chat(request: ChatRequest, user: CurrentUser = Depends(get_current_user)):
+    """Run the agent and return the finished answer in one response.
+
+    The sandbox session is released in the finally block whatever happens, so a
+    failed run cannot leave a microVM running and billing.
+    """
     started_at = time.monotonic()
     session_id, run = prepare_run(request, user)
     context: RunContext = run["context"]
@@ -52,11 +67,17 @@ def chat(request: ChatRequest, user: CurrentUser = Depends(get_current_user)):
         workspace.finish_task_run(run["id"], "failed", str(exc)[:1000])
         raise HTTPException(status_code=500, detail=f"Agent run failed; reference run ID {run['id']}") from exc
     finally:
-        workspace.cleanup_run_work(context)
+        sandbox_runs.close_run_session(context)
 
 
 @router.post("/stream")
 def chat_stream(request: ChatRequest, user: CurrentUser = Depends(get_current_user)):
+    """Run the agent, streaming progress as server-sent events.
+
+    What the UI uses. Emits `run`, then `status` updates while the agent works,
+    then `final` (or `error`). Buffering is disabled so status lines reach the
+    browser as they happen rather than in a burst at the end.
+    """
     _, run = prepare_run(request, user)
     context: RunContext = run["context"]
     return StreamingResponse(

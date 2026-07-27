@@ -1,3 +1,10 @@
+"""Authentication endpoints.
+
+CDX is the production authentication boundary: it validates the user and
+overwrites the `x-fnma-jws-token` header, which this application trusts. The
+development login here is an opt-in local substitute and is disabled by default.
+"""
+
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -18,6 +25,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 def current_user_response(user: CurrentUser) -> Dict[str, Any]:
+    """Shape a user for the browser. Deliberately excludes raw token claims."""
     return {
         "user": {
             "id": user.id,
@@ -33,6 +41,12 @@ def auth_config(
     request: Request,
     x_fnma_jws_token: Optional[str] = Header(default=None, alias="x-fnma-jws-token"),
 ):
+    """Tell the browser how to authenticate, before it has an identity.
+
+    Unauthenticated by necessity: the UI calls this first to decide whether to
+    show the development login prompt or rely on the CDX header. It reveals only
+    which mechanism is available, never anything about a user.
+    """
     cdx_header_present = bool(x_fnma_jws_token and x_fnma_jws_token.strip())
     result: Dict[str, Any] = {
         "development_login_enabled": workspace.DEVELOPMENT_LOGIN_ENABLED,
@@ -54,6 +68,12 @@ def auth_config(
 
 @router.post("/development-login")
 def development_login(login: DevelopmentLoginRequest, request: Request, response: Response):
+    """Issue a signed local identity cookie. Development only.
+
+    Returns 404 rather than 403 when disabled so a production deployment does
+    not advertise that the route exists. The cookie is HTTP-only and strictly
+    same-site, and is signed with a secret held only by this server.
+    """
     if not workspace.DEVELOPMENT_LOGIN_ENABLED:
         raise HTTPException(status_code=404, detail="Development login is disabled")
     subject = login.subject.strip()
@@ -82,4 +102,5 @@ def development_login(login: DevelopmentLoginRequest, request: Request, response
 
 @router.get("/me")
 def auth_me(user: CurrentUser = Depends(get_current_user)):
+    """Return the caller's identity, registering them on first sight."""
     return current_user_response(user)

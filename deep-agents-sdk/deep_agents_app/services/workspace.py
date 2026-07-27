@@ -1,3 +1,14 @@
+"""Core application service: projects, identity, settings and skills.
+
+This module also owns the module-level configuration the rest of the app reads
+(storage roots, development login state) and re-exports the session, artifact
+and runtime helpers at the bottom, so most callers can import one place.
+
+The central invariant: project content is shared and unversioned per user, while
+sessions, runs and artifacts are private. Anything reading private data filters
+on user_id; anything mutating shared content requires PROJECT_ADMIN.
+"""
+
 import os
 import re
 import secrets
@@ -30,7 +41,10 @@ from deep_agents_app.security import (  # noqa: E402
     decode_cdx_token,
     decode_development_token,
 )
-from deep_agents_app.config import load_runtime_paths  # noqa: E402
+from deep_agents_app.config import (  # noqa: E402
+    ensure_child_path as config_ensure_child_path,
+    load_runtime_paths,
+)
 from deep_agents_app.domain import CurrentUser, RunContext  # noqa: E402
 from deep_agents_app.db import connect, initialize_schema  # noqa: E402
 
@@ -39,10 +53,15 @@ logger = logging.getLogger(__name__)
 _PROJECT_CONTENT_LOCKS: Dict[str, threading.RLock] = {}
 _PROJECT_CONTENT_LOCKS_GUARD = threading.Lock()
 
+_PROJECT_REPLICATION_LOCKS: Dict[str, threading.RLock] = {}
+_PROJECT_REPLICATION_GUARD = threading.Lock()
+_PROJECT_REPLICATION_PENDING: set = set()
+
 load_dotenv(BASE_DIR / ".env")
 
 
 def environment_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean setting, accepting 1/true/yes/on in any case."""
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -50,9 +69,27 @@ def environment_flag(name: str, default: bool = False) -> bool:
 
 
 def project_content_lock(project_id: str) -> threading.RLock:
-    """Serialize a project edit with the creation of new task runs."""
+    """Serialize content edits against run creation for one project.
+
+    Prevents a run starting while files it may read are being replaced, and an
+    edit landing while a run is in flight.
+    """
     with _PROJECT_CONTENT_LOCKS_GUARD:
         return _PROJECT_CONTENT_LOCKS.setdefault(project_id, threading.RLock())
+
+
+def project_replication_lock(project_id: str) -> threading.RLock:
+    """Serialize replication of one project's data to the sandbox backend.
+
+    Two syncs running at once could interleave uploads with the deletion of keys
+    the other just wrote. Replication used to inherit this from the content lock
+    by running inside it; now that it runs in the background it needs its own.
+
+    Reentrant so the background worker can hold it across the bookkeeping that
+    decides whether another sync still needs to be queued.
+    """
+    with _PROJECT_REPLICATION_GUARD:
+        return _PROJECT_REPLICATION_LOCKS.setdefault(project_id, threading.RLock())
 
 
 DEVELOPMENT_LOGIN_ENABLED = environment_flag("DEEP_AGENTS_DEV_LOGIN_ENABLED")
@@ -73,12 +110,17 @@ PROJECTS_ROOT = _configured_projects_dir()
 RUNTIME_PATHS = load_runtime_paths(BASE_DIR, PROJECTS_ROOT, STATIC_DIR)
 DB_PATH = RUNTIME_PATHS.app_database
 AGENT_CHECKPOINT_DB_PATH = RUNTIME_PATHS.agent_database
-WORK_DIR = RUNTIME_PATHS.work_dir
+SANDBOX_DIR = RUNTIME_PATHS.sandbox_dir
 ARTIFACTS_DIR = RUNTIME_PATHS.artifacts_dir
 TMP_UPLOADS_DIR = RUNTIME_PATHS.uploads_dir
 
 
 def load_or_create_development_signing_secret(database_dir: Path) -> str:
+    """Load or create the key that signs development login cookies.
+
+    Written with O_EXCL at mode 0600 so two workers starting together cannot
+    each generate a different key and invalidate each other's cookies.
+    """
     key_path = database_dir / ".development-login.key"
     try:
         existing = key_path.read_text(encoding="utf-8").strip()
@@ -161,10 +203,12 @@ PROJECT_FILESYSTEM_ALLOW_PATTERNS = ["/**"]
 
 
 def utc_now() -> str:
+    """The current time as an ISO-8601 UTC string, the format used throughout."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def duration_seconds_between(started_at: Optional[str], completed_at: Optional[str]) -> Optional[float]:
+    """Elapsed seconds between two ISO timestamps, or None if either is absent."""
     if not started_at or not completed_at:
         return None
     try:
@@ -176,20 +220,24 @@ def duration_seconds_between(started_at: Optional[str], completed_at: Optional[s
 
 
 def get_projects_dir() -> Path:
+    """The shared projects root, created if it does not yet exist."""
     PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
     return PROJECTS_ROOT.resolve()
 
 
 def slugify(name: str) -> str:
+    """Turn a display name into a filesystem- and URL-safe identifier."""
     slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
     return slug or f"project-{uuid.uuid4().hex[:8]}"
 
 
 def get_db_connection() -> sqlite3.Connection:
+    """A configured connection to the application database."""
     return connect(DB_PATH)
 
 
 def init_db() -> None:
+    """Prepare the database and reconcile it with the projects on disk."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_db_connection() as conn:
         initialize_schema(conn)
@@ -199,11 +247,17 @@ def init_db() -> None:
 
 
 def project_display_name(slug: str) -> str:
+    """A human-readable name from a slug, keeping known acronyms uppercase."""
     acronyms = {"hpi": "HPI", "nmdb": "NMDB", "fhfa": "FHFA"}
     return " ".join(acronyms.get(part, part.capitalize()) for part in slug.split("-"))
 
 
 def register_project_directories(conn: sqlite3.Connection) -> None:
+    """Register every directory under the projects root as a project.
+
+    Directories are the source of truth: dropping one in and restarting is a
+    supported way to add a project.
+    """
     projects_dir = get_projects_dir()
     now = utc_now()
     for project_path in sorted(projects_dir.iterdir()):
@@ -223,6 +277,7 @@ def register_project_directories(conn: sqlite3.Connection) -> None:
 
 
 def upsert_current_user(identity: TokenIdentity) -> CurrentUser:
+    """Find or create the local user row for an authenticated identity."""
     now = utc_now()
     with get_db_connection() as conn:
         row = conn.execute(
@@ -256,6 +311,11 @@ def get_current_user(
     request: Request,
     x_fnma_jws_token: Optional[str] = Header(default=None, alias="x-fnma-jws-token"),
 ) -> CurrentUser:
+    """Resolve the caller from the CDX header, or the development cookie.
+
+    The FastAPI dependency behind every authenticated route. Raises 401 when
+    neither is present or valid.
+    """
     try:
         if x_fnma_jws_token and x_fnma_jws_token.strip():
             identity = decode_cdx_token(x_fnma_jws_token)
@@ -276,6 +336,7 @@ def get_current_user(
 
 
 def require_project_admin(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Dependency for routes that mutate shared content. Raises 403 otherwise."""
     if not user.is_project_admin:
         raise HTTPException(status_code=403, detail="PROJECT_ADMIN role is required")
     return user
@@ -287,6 +348,7 @@ def add_audit_event(
     project_id: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """Record who did what, for administrative actions."""
     with get_db_connection() as conn:
         conn.execute(
             """
@@ -298,12 +360,14 @@ def add_audit_event(
 
 
 def parse_available_models() -> List[str]:
+    """The model allowlist from the environment."""
     raw = os.environ.get("AVAILABLE_MODELS", "")
     models = [model.strip() for model in raw.split(",") if model.strip()]
     return models or DEFAULT_AVAILABLE_MODELS.copy()
 
 
 def env_default_model(available_models: List[str]) -> str:
+    """The configured default model, falling back to the first allowed one."""
     configured = os.environ.get("DEFAULT_MODEL", "").strip()
     if configured and configured in available_models:
         return configured
@@ -311,6 +375,7 @@ def env_default_model(available_models: List[str]) -> str:
 
 
 def env_max_sessions_per_project() -> int:
+    """The configured per-project session cap."""
     raw = os.environ.get("MAX_SESSIONS_PER_PROJECT", "").strip()
     try:
         value = int(raw)
@@ -320,6 +385,7 @@ def env_max_sessions_per_project() -> int:
 
 
 def coerce_max_sessions(value: Any, fallback: int) -> int:
+    """Read a stored cap, falling back when it is missing or invalid."""
     try:
         return min(max(int(value), 1), 100)
     except (TypeError, ValueError):
@@ -327,6 +393,7 @@ def coerce_max_sessions(value: Any, fallback: int) -> int:
 
 
 def bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """An integer setting clamped to a sane range, ignoring bad values."""
     try:
         value = int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
@@ -335,6 +402,7 @@ def bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def get_app_settings() -> Dict[str, Any]:
+    """Current settings, seeded from the environment on first use."""
     available_models = parse_available_models()
     default_model = env_default_model(available_models)
     max_sessions = env_max_sessions_per_project()
@@ -362,6 +430,7 @@ def get_app_settings() -> Dict[str, Any]:
 
 
 def save_app_settings(default_model: str, max_sessions_per_project: int) -> Dict[str, Any]:
+    """Persist settings, rejecting a model outside the allowlist."""
     available_models = parse_available_models()
     if default_model not in available_models:
         raise HTTPException(status_code=400, detail="Default model must be one of the available models")
@@ -394,6 +463,7 @@ def prune_project_sessions(
     project_id: str,
     max_sessions: Optional[int] = None,
 ) -> None:
+    """Delete the user's oldest conversations beyond the configured cap."""
     limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
     limit = coerce_max_sessions(limit, DEFAULT_MAX_SESSIONS_PER_PROJECT)
     with get_db_connection() as conn:
@@ -414,6 +484,7 @@ def prune_project_sessions(
 
 
 def prune_all_project_sessions(max_sessions: Optional[int] = None) -> None:
+    """Apply the session cap to every user, after the cap is lowered."""
     limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
     with get_db_connection() as conn:
         rows = conn.execute(
@@ -428,6 +499,7 @@ def list_project_sessions(
     project_id: str,
     prune: bool = True,
 ) -> List[Dict[str, Any]]:
+    """The caller's conversations with any in-flight run surfaced for the UI."""
     if prune:
         prune_project_sessions(user_id, project_id)
     with get_db_connection() as conn:
@@ -456,6 +528,7 @@ def list_project_sessions(
 
 
 def row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
+    """Map a project row to a dictionary, without its filesystem path."""
     return {
         "id": row["id"],
         "name": row["name"],
@@ -469,6 +542,10 @@ def row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def public_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip internal fields so a project can be returned to the browser.
+
+    Notably removes the filesystem path: server paths are never exposed.
+    """
     return {
         key: value
         for key, value in project.items()
@@ -477,14 +554,25 @@ def public_project(project: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def ensure_child_path(parent: Path, child: Path) -> Path:
-    parent_resolved = parent.resolve()
-    child_resolved = child.resolve()
-    if child_resolved != parent_resolved and parent_resolved not in child_resolved.parents:
-        raise HTTPException(status_code=400, detail="Path escapes the project directory")
-    return child_resolved
+    """Resolve `child` and assert it stays inside `parent`, as an HTTP error.
+
+    The containment rule itself lives in config.ensure_child_path. This wrapper
+    only translates its ValueError into the 400 the API layer expects, so the
+    check cannot be reimplemented in two places and drift.
+    """
+    try:
+        return config_ensure_child_path(parent, child)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="Path escapes the project directory"
+        ) from exc
 
 
 def get_project(project_id: str) -> Dict[str, Any]:
+    """Fetch an active project and resolve its root, or raise.
+
+    Raises 404 when unknown and 409 while it is being deleted.
+    """
     with get_db_connection() as conn:
         row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     if not row:
@@ -500,18 +588,26 @@ def get_project(project_id: str) -> Dict[str, Any]:
 
 
 def get_project_root(project_id: str) -> Path:
+    """The absolute path of a project's directory."""
     return Path(get_project(project_id)["path"])
 
 
 def get_skill_dir(project_id: str) -> Path:
+    """The skills directory inside a project."""
     return get_project_root(project_id) / "skills"
 
 
 def project_skills_source(project: Dict[str, Any]) -> List[tuple[str, str]]:
+    """The skill sources handed to the Deep Agents graph."""
     return [("/skills", project["name"])]
 
 
 def project_filesystem_permission_specs() -> List[Dict[str, Any]]:
+    """Filesystem rules for the agent's own file tools.
+
+    These constrain the agent's built-in tools only. Generated Python is
+    constrained by the sandbox instead, which is a separate mechanism.
+    """
     return [
         {
             "operations": ["read", "write"],
@@ -538,38 +634,37 @@ def create_run_context(
     run_id: str,
     create: bool = True,
 ) -> RunContext:
-    work_directory = ensure_child_path(
-        WORK_DIR,
-        WORK_DIR / user_id / project_id / session_id / run_id,
-    )
+    """Build the context identifying a run and its artifact staging directory."""
     artifact_directory = ensure_child_path(
         ARTIFACTS_DIR,
         ARTIFACTS_DIR / user_id / project_id / session_id / run_id,
     )
     if create:
-        work_directory.mkdir(parents=True, exist_ok=True)
         artifact_directory.mkdir(parents=True, exist_ok=True)
     return RunContext(
         user_id=user_id,
         project_id=project_id,
         session_id=session_id,
         run_id=run_id,
-        work_directory=work_directory,
         artifact_directory=artifact_directory,
     )
 
 
 def project_artifact_context(context: RunContext) -> Dict[str, str]:
+    """Artifact locations for a run, reported by the isolation audit."""
     return {
         "session_id": context.session_id,
         "run_id": context.run_id,
-        "work_directory": str(context.work_directory),
         "artifact_directory": str(context.artifact_directory),
         "artifact_url_note": "Artifact URLs are registered and added by the server after the run.",
     }
 
 
 def project_isolation_audit(user_id: str, project_id: str) -> Dict[str, Any]:
+    """Re-check the isolation invariants and report which sandbox is active.
+
+    Intended as a deployment smoke test rather than a routine call.
+    """
     project = get_project(project_id)
     project_root = Path(project["path"])
     projects_dir = get_projects_dir()
@@ -606,16 +701,6 @@ def project_isolation_audit(user_id: str, project_id: str) -> Dict[str, Any]:
                 / sample_run_id
             ).resolve()
         ),
-        "work_directory_user_project_session_run_scoped": (
-            run_context.work_directory.resolve()
-            == (
-                WORK_DIR
-                / user_id
-                / project_id
-                / sample_session_id
-                / sample_run_id
-            ).resolve()
-        ),
     }
 
     return {
@@ -636,12 +721,101 @@ def project_isolation_audit(user_id: str, project_id: str) -> Dict[str, Any]:
             "sample_thread_id": session_thread_id(user_id, project_id, sample_session_id),
         },
         "artifacts": artifact_context,
+        "sandbox_backend": _sandbox_backend_name(),
         "checks": checks,
         "passed": all(checks.values()),
     }
 
 
+def _sandbox_backend_name() -> str:
+    from deep_agents_app.runtime.sandbox import configured_backend_name
+
+    return configured_backend_name()
+
+
+def replicate_project_data(project_id: str) -> None:
+    """Push a project's data/ to wherever the sandbox reads it from.
+
+    A no-op for backends that read the project directory directly. Failures are
+    logged rather than raised: the content change itself has already succeeded,
+    and the next run re-checks the replica before using it.
+
+    Synchronous. Callers on a request thread want schedule_project_replication.
+    """
+    from deep_agents_app.runtime.sandbox import get_backend  # circular at import time
+
+    try:
+        with project_replication_lock(project_id):
+            project = get_project(project_id)
+            backend = get_backend()
+            changed = backend.sync_project_data(
+                project["slug"],
+                Path(project["path"]) / "data",
+                project["content_revision"],
+            )
+        if changed:
+            logger.info(
+                "Replicated %s object(s) for project %s at revision %s",
+                changed,
+                project_id,
+                project["content_revision"],
+            )
+    except Exception as exc:  # noqa: BLE001 - never fail an edit over replication
+        logger.error(
+            "Could not replicate project %s to the sandbox backend: %s. "
+            "The next run will retry before executing anything.",
+            project_id,
+            exc,
+        )
+
+
+def schedule_project_replication(project_id: str) -> None:
+    """Replicate a project's data in the background.
+
+    Content edits hold the project content lock, which also gates run creation,
+    and replication can mean listing and uploading an entire dataset. Doing that
+    inline blocked every run in the project, and the user's own request, for as
+    long as the transfer took.
+
+    Correctness does not depend on this finishing, or starting: a run verifies
+    the replica's revision before using it and syncs inline if it is stale. This
+    is a pre-warm, so an interrupted one costs a slower first prompt, nothing
+    more.
+
+    Edits are coalesced. A sync reads the project's current revision when it
+    runs rather than the one that scheduled it, so a single queued pass covers
+    every edit made before it starts, and a burst of file operations leaves at
+    most one sync running and one waiting.
+    """
+    with _PROJECT_REPLICATION_GUARD:
+        if project_id in _PROJECT_REPLICATION_PENDING:
+            return
+        _PROJECT_REPLICATION_PENDING.add(project_id)
+
+    def worker() -> None:
+        try:
+            with project_replication_lock(project_id):
+                # Cleared once this pass is the one running, so edits arriving
+                # behind it queue exactly one successor rather than a thread each.
+                with _PROJECT_REPLICATION_GUARD:
+                    _PROJECT_REPLICATION_PENDING.discard(project_id)
+                replicate_project_data(project_id)
+        except Exception:  # noqa: BLE001 - a background thread must not escape
+            logger.exception("Background replication failed for project %s", project_id)
+            with _PROJECT_REPLICATION_GUARD:
+                _PROJECT_REPLICATION_PENDING.discard(project_id)
+
+    threading.Thread(
+        target=worker, name=f"replicate-{project_id}", daemon=True
+    ).start()
+
+
 def touch_project(project_id: str, bump_revision: bool = False) -> None:
+    """Mark a project as updated, optionally bumping its content revision.
+
+    Bumping the revision means the sandbox's copy of the data is stale, so this
+    triggers replication.
+    """
     with get_db_connection() as conn:
         if bump_revision:
             conn.execute(
@@ -656,6 +830,8 @@ def touch_project(project_id: str, bump_revision: bool = False) -> None:
             conn.execute(
                 "UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id)
             )
+    if bump_revision:
+        schedule_project_replication(project_id)
 
 
 def record_project_content_mutation(
@@ -664,7 +840,11 @@ def record_project_content_mutation(
     action: str,
     details: Dict[str, Any],
 ) -> None:
-    """Atomically bump the shared content revision and write its audit event."""
+    """Atomically bump the content revision, audit it, and replicate.
+
+    The path individual file and folder edits take. touch_project covers bulk
+    operations; both must trigger replication.
+    """
     now = utc_now()
     with get_db_connection() as conn:
         updated = conn.execute(
@@ -684,9 +864,15 @@ def record_project_content_mutation(
             """,
             (user_id, action, project_id, json.dumps(details, sort_keys=True), now),
         )
+    # Individual file and folder edits bump the revision here rather than through
+    # touch_project, so the replication hook has to cover both paths. Dispatched
+    # rather than run inline: this call sits inside the project content lock,
+    # which also gates run creation.
+    schedule_project_replication(project_id)
 
 
 def create_project_record(name: str, created_by: str) -> Dict[str, Any]:
+    """Create a project row and its directory skeleton."""
     projects_dir = get_projects_dir()
     base_slug = slugify(name)
     slug = base_slug
@@ -722,6 +908,7 @@ def create_project_record(name: str, created_by: str) -> Dict[str, Any]:
 
 
 def relative_project_path(project_root: Path, user_path: str) -> Path:
+    """Resolve a user-supplied path inside a project, refusing escapes."""
     if not user_path or user_path in {".", "/"}:
         return project_root
     normalized = user_path.replace("\\", "/").lstrip("/")
@@ -730,6 +917,7 @@ def relative_project_path(project_root: Path, user_path: str) -> Path:
 
 
 def parse_skill_frontmatter(skill_md: Path) -> Dict[str, str]:
+    """Read the name and description from a SKILL.md front matter block."""
     try:
         content = skill_md.read_text(encoding="utf-8")
     except Exception as exc:
@@ -751,6 +939,7 @@ def parse_skill_frontmatter(skill_md: Path) -> Dict[str, str]:
 
 
 def validate_skill_metadata(skill_dir: Path) -> None:
+    """Check one skill's front matter and that its name matches its folder."""
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.exists():
         return
@@ -780,6 +969,11 @@ def validate_skill_metadata(skill_dir: Path) -> None:
 
 
 def validate_project_skills(project_id: str) -> None:
+    """Validate every skill in a project, raising on the first problem.
+
+    Run before publishing a content change, so a malformed skill is rejected at
+    edit time rather than surfacing as a broken agent later.
+    """
     skills_dir = get_skill_dir(project_id)
     if not skills_dir.exists():
         return
@@ -790,6 +984,7 @@ def validate_project_skills(project_id: str) -> None:
 
 
 def validate_all_project_skills_once() -> None:
+    """Validate all projects once per process, at startup."""
     global _SKILLS_VALIDATED
     if _SKILLS_VALIDATED:
         return
@@ -806,6 +1001,7 @@ def validate_all_project_skills_once() -> None:
 
 
 def scan_project_skills(project_id: str) -> List[Dict[str, str]]:
+    """Discover a project's skills and their descriptions."""
     skills_dir = get_skill_dir(project_id)
     skills: List[Dict[str, str]] = []
     if not skills_dir.exists():
@@ -833,6 +1029,7 @@ def scan_project_skills(project_id: str) -> List[Dict[str, str]]:
 
 
 def list_project_files(project_root: Path) -> List[Dict[str, Any]]:
+    """List a project's files for the agent's file picker."""
     items: List[Dict[str, Any]] = []
     if not project_root.exists():
         return items
@@ -861,6 +1058,11 @@ def list_project_files(project_root: Path) -> List[Dict[str, Any]]:
 
 
 def reset_project_contents_transactional(project_root: Path) -> None:
+    """Empty a project by swapping in a fresh directory.
+
+    Builds the replacement beside the original and moves it into place, so an
+    interrupted reset leaves the existing content intact.
+    """
     project_root = ensure_child_path(get_projects_dir(), project_root)
     staging = ensure_child_path(
         get_projects_dir(),
@@ -889,6 +1091,7 @@ def reset_project_contents_transactional(project_root: Path) -> None:
 
 
 def delete_project_resources(project_id: str, project_root: Path) -> None:
+    """Delete a project's row, files and every session that referenced it."""
     ensure_no_active_project_runs(project_id)
     with get_db_connection() as conn:
         sessions = conn.execute(
@@ -930,13 +1133,11 @@ from deep_agents_app.services.artifacts import (  # noqa: E402, F401
     append_artifact_links,
     prepare_response_artifacts,
     register_run_artifacts,
-    unique_artifact_path,
 )
 
 
 from deep_agents_app.services.sessions import (  # noqa: E402, F401
     add_chat_message,
-    cleanup_run_work,
     create_session,
     create_task_run,
     delete_session_resources,

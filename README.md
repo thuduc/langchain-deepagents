@@ -156,8 +156,7 @@ SQLite databases and their WAL/SHM sidecars are stored together under:
 DEEP_AGENTS_DB_DIR=deep-agents-sdk/runtime/databases
 ```
 
-Private run workspaces, temporary generated code, upload previews, and retained
-artifacts are stored under:
+Sandbox workspaces, upload previews, and retained artifacts are stored under:
 
 ```text
 DEEP_AGENTS_GENERATED_DIR=deep-agents-sdk/runtime/generated
@@ -169,12 +168,27 @@ The generated root has one consistent layout:
 
 ```text
 generated/
-├── work/<user>/<project>/<session>/<run>/
+├── sandbox/<user>/<project>/<session>/<run>/   local backend only
 ├── artifacts/<user>/<project>/<session>/<run>/
 └── uploads/<user>/<preview-token>.zip
 ```
 
-Run workspaces and temporary generated code are deleted after each run. Registered artifacts remain until their owning session or project is deleted or pruned. `DEEP_AGENTS_RUN_ARTIFACT_DIR` and `DEEP_AGENTS_PROJECT_DIR` are injected into generated Python processes for the active run; they are not deployment settings and must not be added to `.env`.
+Sandbox workspaces are destroyed when their run ends. Registered artifacts remain until their owning session or project is deleted or pruned; with the `s3` artifact store they are staged here briefly and then uploaded, leaving nothing behind.
+
+### Sandboxed code execution
+
+Agent-generated Python never runs in the server process. Two backends implement the same contract, selected by `DEEP_AGENTS_SANDBOX`:
+
+| Value | Behaviour |
+| --- | --- |
+| `local` | A subprocess on this host with resource limits, no network egress, and a disposable workspace. A development aid, **not** an isolation boundary: the code runs as the server's own OS user. |
+| `agentcore` | Amazon Bedrock AgentCore Code Interpreter. One dedicated microVM per run, in VPC mode with no route to the internet. |
+
+Both present the same layout to generated code: project data read-only at `data/`, results written to `out/`, and anything else the code creates alongside them collected as an artifact. Skills therefore need no per-environment wording.
+
+`DEEP_AGENTS_ARTIFACT_STORE` selects where retained artifacts live (`local` or `s3`) and is deliberately independent of the sandbox backend, so a developer can exercise real microVM isolation while keeping artifacts on disk. ECS Fargate requires `s3`, because a task filesystem is neither shared between tasks nor durable.
+
+With `agentcore`, a project's `data/` is mirrored to S3 whenever its content changes, and each run re-checks that mirror before executing so it can never read stale data. See `infra/README.md` for the AWS resources this requires.
 
 `MAX_CONCURRENT_RUNS_PER_USER` limits simultaneous tasks per authenticated user; the default is `3`.
 
@@ -308,7 +322,9 @@ Each project keeps skills under `skills/<skill-name>/SKILL.md`. On project selec
 
 Every successful `data/` or `skills/` edit increments `content_revision`. Data-only changes are visible to the next prompt through the shared project path and do not rebuild the agent graph. Changes under `skills/` are validated (including `SKILL.md` frontmatter and directory/name agreement) before publication, invalidate the cached project agent, and cause skills to be loaded lazily before the next prompt. Existing running prompts are never hot-reloaded because project edits are blocked until all project runs finish.
 
-Generated Python runs from a private per-user/project/session/run workspace, not from the shared project directory. Project data remains readable as `data/<filename>` through a workspace link. Generated files should be written to the `artifact_directory` returned by `get_project_context` (or `DEEP_AGENTS_RUN_ARTIFACT_DIR` inside Python). Relative generated files are automatically moved into the same run artifact directory before registration. The server audits the shared project tree and quarantines newly created project files as private artifacts; modifications or deletions of existing shared source files are logged and reported as execution errors.
+Generated Python runs in a sandbox, never in the server process and never from the shared project directory. It reads project data as `data/<filename>` and should write results to `out/<filename>`; anything else it creates alongside those is collected as an artifact too, so a relative `savefig()` lands correctly without the model knowing where it ran. Every file collected is registered as a private, per-run artifact served only to its owner through `/api/artifacts/{id}`.
+
+With `agentcore` the sandbox is a microVM that has no filesystem path to the project at all, so shared content cannot be touched. With `local` it can, since the code runs as the server's own OS user — that backend therefore audits the project tree around every execution, quarantining newly created files as private artifacts and reporting modifications or deletions of existing shared source as execution errors.
 
 ## Tests
 

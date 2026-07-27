@@ -1,3 +1,5 @@
+"""SQLite connection factory shared by every repository and service."""
+
 import sqlite3
 from pathlib import Path
 
@@ -13,6 +15,13 @@ class ClosingSQLiteConnection(sqlite3.Connection):
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
+    """Open a SQLite connection configured for concurrent multi-user access.
+
+    WAL journalling lets readers proceed while a writer holds the database, the
+    busy timeout absorbs brief write contention rather than raising, and foreign
+    keys are enforced so deleting a session or project cascades to everything it
+    owns instead of leaving orphaned rows.
+    """
     connection = sqlite3.connect(
         database_path,
         timeout=10,

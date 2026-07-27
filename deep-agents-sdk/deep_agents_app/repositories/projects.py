@@ -1,13 +1,17 @@
+"""SQL for the projects table. No business rules live here."""
+
 import sqlite3
 
 
 def list_active(connection: sqlite3.Connection):
+    """Projects not being deleted, most recently updated first."""
     return connection.execute(
         "SELECT * FROM projects WHERE status = 'active' ORDER BY updated_at DESC, name ASC"
     ).fetchall()
 
 
 def update_name(connection: sqlite3.Connection, project_id: str, name: str, updated_at: str):
+    """Rename a project and return the updated row."""
     connection.execute(
         "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
         (name, updated_at, project_id),

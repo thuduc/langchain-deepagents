@@ -1,3 +1,10 @@
+"""Turning tokens into identities.
+
+Production identities arrive from CDX and are deliberately not signature-checked
+here; see decode_cdx_token for why. Development identities are minted and
+verified by this server and are fully validated.
+"""
+
 from __future__ import annotations
 
 import time
@@ -14,11 +21,15 @@ DEVELOPMENT_TOKEN_ISSUER = "deep-agents-development-login"
 
 
 class AuthenticationError(ValueError):
+    """The caller could not be identified from the request."""
+
     pass
 
 
 @dataclass(frozen=True)
 class TokenIdentity:
+    """Who the caller is, as asserted by whichever issuer vouched for them."""
+
     issuer: str
     subject: str
     roles: FrozenSet[str]
@@ -26,6 +37,7 @@ class TokenIdentity:
 
     @property
     def is_project_admin(self) -> bool:
+        """Whether this identity carries the one role the app authorizes on."""
         return PROJECT_ADMIN_ROLE in self.roles
 
 
@@ -81,6 +93,7 @@ def create_development_token(
     signing_secret: str,
     lifetime_seconds: int,
 ) -> str:
+    """Mint a short-lived local identity for the development login."""
     now = int(time.time())
     return jwt.encode(
         {
@@ -96,6 +109,11 @@ def create_development_token(
 
 
 def decode_development_token(token: str, signing_secret: str) -> TokenIdentity:
+    """Verify a locally issued development identity.
+
+    Unlike the CDX path this does check the signature, because the server itself
+    minted the token and nothing upstream has vouched for it.
+    """
     try:
         claims = jwt.decode(
             token,
