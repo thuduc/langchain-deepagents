@@ -192,6 +192,35 @@ With `agentcore`, a project's `data/` is mirrored to S3 whenever its content cha
 
 `MAX_CONCURRENT_RUNS_PER_USER` limits simultaneous tasks per authenticated user; the default is `3`.
 
+### Where the agent itself runs
+
+The sandbox setting decides where the *model's* Python runs. A separate setting, `DEEP_AGENTS_AGENT_TRANSPORT`, decides where the agent graph runs — the thing that calls the model, drives the sandbox, and produces the answer:
+
+| Value | Behaviour |
+| --- | --- |
+| `local` | In the web application's own process. The development default, and the only one needing no AWS. |
+| `http` | Another process over plain HTTP, via `DEEP_AGENTS_AGENT_URL`. The same contract as `runtime` without AWS in the way, which is how the boundary is tested on one machine. |
+| `runtime` | An AgentCore Runtime microVM, via `AGENTCORE_RUNTIME_ARN`. |
+
+The agent tier is a separate image, `Dockerfile.agent`, built for `linux/arm64` because Runtime accepts nothing else. It carries no frontend, no project content, and no application database: identity arrives already established by the web tier, which is the only side that can authenticate anyone. Its project files are hydrated from the S3 mirror on first use and refreshed whenever `content_revision` changes.
+
+Moving the agent off this host also moves two pieces of state out of reach, so each gets a setting of its own:
+
+| Setting | `local` / `sqlite` | Remote |
+| --- | --- | --- |
+| `DEEP_AGENTS_CHECKPOINTER` | a file under `DEEP_AGENTS_DB_DIR` | `dynamodb` — a table any process can reach, needing `CHECKPOINT_DDB_TABLE` |
+| `DEEP_AGENTS_CANCELLATION` | an in-process registry | `dynamodb` — a record the running side polls |
+
+Both failures are silent if you get this wrong, so the server refuses to start instead: a non-`local` transport with a host-local checkpointer would give the agent amnesia on every turn while the transcript still rendered normally, and with an in-process cancellation registry the web tier would record a stop that nothing ever acts on. The startup check names the setting to change.
+
+`./infra/deploy-app.sh` creates the checkpoint table from `infra/agentcore-app.yaml`; `./infra/deploy.sh` creates the sandbox resources from `infra/agentcore-sandbox.yaml`. See `infra/README.md`.
+
+### The model gateway key
+
+`PORTKEY_API_KEY` is for development. Anywhere the value would sit in a deployed configuration, set `PORTKEY_API_KEY_SECRET_ARN` instead and let the container read the key at startup. A runtime's environment variables are readable through its control plane by anyone with read access — which broad read-only policies grant — and passing the key as a stack parameter additionally leaves it in shell history and CI logs. An ARN is worth nothing on its own, every read of the secret is a CloudTrail event, and the key can be rotated without a deployment. The plain variable wins where both are present, so a developer never reaches AWS for it.
+
+The secret may hold the key as a bare string or as JSON with a `PORTKEY_API_KEY`, `api_key`, `key`, or `value` field. `PORTKEY_PROVIDER_SLUG` is required alongside it and has no default, in the environment or in the CloudFormation template: a default would be a provider nobody chose, and the mistake would only surface when a prompt reached the gateway.
+
 ## Local development
 
 Enable the same-port development identity popup in `.env`:
@@ -236,7 +265,7 @@ Choose the internal host and port required by the deployment, but do not expose 
 ## Authorization policy
 
 | Resource/action | Authenticated user | `PROJECT_ADMIN` |
-|---|---:|---:|
+| --- | ---: | ---: |
 | List and view shared projects | Yes | Yes |
 | View shared project contents/media | Yes | Yes |
 | Create, rename, import, edit, clear, or delete projects | No | Yes |
@@ -307,8 +336,7 @@ Private chats and runs:
 - `GET /api/projects/{project_id}/sessions/{session_id}`
 - `DELETE /api/projects/{project_id}/sessions/{session_id}`
 - `GET /api/projects/{project_id}/sessions/{session_id}/runs`
-- `POST /api/chat`
-- `POST /api/chat/stream`
+- `POST /api/chat/stream` — the only way to start a run
 
 Private generated files:
 
@@ -354,8 +382,10 @@ npm run test:e2e
 
 The suites cover the trusted-CDX claim contract, mock-CDX identity switching, header enforcement, admin authorization, shared project visibility, cross-user session isolation, per-user pruning, checkpoint namespacing, private artifact access and cleanup, private Python workspaces, recovery of misplaced project outputs, upload ownership, ZIP traversal rejection, project-local skill discovery, Markdown rendering, prompt metadata, and concurrent run-state isolation.
 
+They also cover the agent tier, which the in-process path never exercises: the protocol's JSON round trip, the invocation payload against the schema that receives it, the HTTP transport driven end to end against the real agent server, the AgentCore Runtime call, project hydration including the files it must delete, the generated-file hand-off, run ownership and abandonment, and upgrading a database that predates the current schema.
+
 ## Security boundary
 
 Markdown responses are sanitized and the server sends a restrictive Content Security Policy. React, Marked, DOMPurify, KaTeX, and Highlight.js are compiled into self-hosted frontend assets; runtime script CDNs are not allowed. The production browser does not receive or persist the CDX header token. The mock-CDX development identity cookie is HTTP-only and restricted to development usage.
 
-Generated Python execution is not sandboxed. It runs as the server's operating-system user. Deploy this version only for trusted internal users and trusted project administrators.
+Generated Python execution is sandboxed, and how strongly depends on `DEEP_AGENTS_SANDBOX`. With `agentcore` each run gets its own microVM with no route to the internet, and the sandbox has no filesystem path to the shared project at all. With `local` the code runs as the server's own operating-system user, which is a development aid and not an isolation boundary; a deployment using it should be treated as trusting every authenticated user with shell access to the server, and the server logs a warning at startup saying so. See [Sandboxed code execution](#sandboxed-code-execution).

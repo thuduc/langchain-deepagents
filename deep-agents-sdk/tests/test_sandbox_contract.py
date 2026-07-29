@@ -5,10 +5,12 @@ against a stub boto3 session, which verifies the call sequence, the session tags
 and the scoping of the generated session policy without needing AWS.
 """
 
+import io
 import json
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
 import unittest
 import uuid
@@ -25,7 +27,9 @@ from deep_agents_app.runtime.sandbox import (  # noqa: E402
     SessionSpec,
     create_backend,
 )
+from deep_agents_app.runtime.sandbox import archive as archive_module  # noqa: E402
 from deep_agents_app.runtime.sandbox.agentcore import AgentCoreSandbox  # noqa: E402
+from deep_agents_app.runtime.sandbox.archive import extract_artifacts  # noqa: E402
 from deep_agents_app.runtime.sandbox.base import (  # noqa: E402
     MAX_STREAM_CHARACTERS,
     clip_text,
@@ -39,8 +43,14 @@ class SandboxTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="deep-agents-sandbox-test-"))
         self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
-        self.project_data = self.tmp_dir / "project" / "data"
+        self.project_root = self.tmp_dir / "project"
+        self.project_data = self.project_root / "data"
         self.project_data.mkdir(parents=True)
+        # Skills sit alongside data and are mirrored too: the agent's prompts are
+        # built by reading them, so they must exist wherever the agent runs.
+        skill = self.project_root / "skills" / "pricing"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: pricing\n---\n", encoding="utf-8")
         (self.project_data / "prices.csv").write_text(
             "region,value\nsouth,110\nwest,125\n", encoding="utf-8"
         )
@@ -402,41 +412,41 @@ class AgentCoreSandboxTests(SandboxTestCase):
             with self.assertRaisesRegex(SandboxError, "AGENTCORE_REGION"):
                 backend.preflight()
 
-    def test_session_policy_is_scoped_to_one_project_and_run(self):
+    def test_session_policy_is_scoped_to_one_project_s_data(self):
+        """data/ only: the mirror also carries skills, which the sandbox never reads."""
         policy = self.backend.session_policy(self.spec())
-        read, listing, write = policy["Statement"]
+        read, listing = policy["Statement"]
 
         self.assertEqual(
-            read["Resource"], "arn:aws:s3:::deepagents-test/projects/hpi-analytics/*"
-        )
-        self.assertEqual(
-            write["Resource"],
-            "arn:aws:s3:::deepagents-test/staging/u-alice/p-hpi/s-1/r-42/*",
+            read["Resource"],
+            "arn:aws:s3:::deepagents-test/projects/hpi-analytics/data/*",
         )
         self.assertEqual(listing["Action"], "s3:ListBucket")
 
         serialized = str(policy)
         self.assertNotIn("u-bob", serialized)
-        self.assertNotIn("/staging/*", serialized)
-        # The sandbox must never be able to write into the served namespace.
         self.assertNotIn("/artifacts/", serialized)
+        self.assertNotIn("/skills", serialized)
 
-    def test_session_policy_never_grants_read_over_staging(self):
-        """Nothing in a run's credentials may read back what it uploaded: writes
-        use PutObject, and the server reads staging itself."""
+    def test_session_credentials_grant_no_write_at_all(self):
+        """Output returns inline, so nothing in the sandbox needs to write to S3.
+
+        These credentials sit in the microVM where generated code can read them,
+        so every permission they carry is a permission that code has.
+        """
         policy = self.backend.session_policy(self.spec())
         for statement in policy["Statement"]:
             actions = statement["Action"]
             actions = [actions] if isinstance(actions, str) else actions
-            if "staging" in str(statement["Resource"]):
-                self.assertNotIn("s3:GetObject", actions)
-                self.assertNotIn("s3:ListBucket", actions)
+            for action in actions:
+                self.assertFalse(
+                    action.startswith(("s3:Put", "s3:Delete", "s3:Abort", "s3:Create")),
+                    f"write action leaked into the session policy: {action}",
+                )
 
     def test_session_tags_come_from_the_spec(self):
         tags = {tag["Key"]: tag["Value"] for tag in self.backend.session_tags(self.spec())}
-        self.assertEqual(
-            tags, {"slug": "hpi-analytics", "run": "u-alice/p-hpi/s-1/r-42"}
-        )
+        self.assertEqual(tags, {"slug": "hpi-analytics"})
 
     def test_assume_role_stays_within_the_packed_size_budget(self):
         """AWS packs the session policy and tags into one small budget.
@@ -510,28 +520,41 @@ class AgentCoreSandboxTests(SandboxTestCase):
         self.assertEqual(result.stdout, "42\n")
         self.assertTrue(result.ok)
 
-    def test_collect_artifacts_uploads_from_the_sandbox(self):
+    def test_collect_artifacts_packs_reads_and_clears(self):
+        self.stub.client_class = ArchiveReturningClient
+        ArchiveReturningClient.archive = _tar_gz({"out/summary.csv": b"a,b\n1,2\n"})
         session = self.backend.open_session(self.spec())
         self.addCleanup(session.close)
-        self.backend.download_prefix = lambda prefix, destination, seen=None: []
         self.stub.calls.clear()
+        destination = self.tmp_dir / "artifacts"
 
-        session.collect_artifacts(self.tmp_dir / "artifacts")
+        collected = session.collect_artifacts(destination)
 
-        # 'cp --recursive', not 'sync': sync needs s3:ListBucket on the
-        # destination, which the run's scoped credentials deliberately lack.
+        self.assertEqual([path.name for path in collected], ["summary.csv"])
+        self.assertEqual((destination / "summary.csv").read_bytes(), b"a,b\n1,2\n")
+
+        commands = self.stub.commands()
         self.assertTrue(
-            any(
-                "aws s3 cp --recursive work "
-                "s3://deepagents-test/staging/u-alice/p-hpi/s-1/r-42/" in command
-                and "__pycache__" in command
-                for command in self.stub.commands()
-            ),
-            self.stub.commands(),
+            any("tar -czf collect.tgz -C work --exclude=./data ." in c for c in commands),
+            commands,
         )
-        self.assertFalse(
-            any("aws s3 sync" in command for command in self.stub.commands())
-        )
+        # The working directory is emptied so the next archive holds only what
+        # the next execution produced.
+        self.assertTrue(any("rm -rf" in c and "! -name data" in c for c in commands), commands)
+        # Nothing is uploaded: that is the entire point of this transport.
+        self.assertFalse(any("aws s3 cp" in c and "work" in c for c in commands), commands)
+
+    def test_collect_artifacts_refuses_an_oversized_archive(self):
+        """Raised before the workspace is cleared, so the model can shrink it."""
+        self.stub.client_class = ArchiveReturningClient
+        ArchiveReturningClient.archive = b""
+        ArchiveReturningClient.reported_size = 64 * 1024 * 1024
+        self.addCleanup(setattr, ArchiveReturningClient, "reported_size", None)
+        session = self.backend.open_session(self.spec())
+        self.addCleanup(session.close)
+
+        with self.assertRaisesRegex(SandboxError, "over the 16 MB limit"):
+            session.collect_artifacts(self.tmp_dir / "artifacts")
 
     def test_config_sent_to_agentcore_omits_the_cpu_limit(self):
         """RLIMIT_CPU is cumulative, and the remote kernel outlives one execution."""
@@ -611,14 +634,24 @@ class AgentCoreSandboxTests(SandboxTestCase):
         backend = create_backend("local")
         self.assertTrue(backend.project_data_current("hpi-analytics", 7))
         self.assertEqual(
-            backend.sync_project_data("hpi-analytics", self.project_data, 7), 0
+            backend.sync_project_content("hpi-analytics", self.project_root, 7), 0
+        )
+
+    def _sync(self, revision=9, objects=None):
+        self.stub.client_class = SyncingS3Client
+        SyncingS3Client.objects = objects or {}
+        SyncingS3Client.uploaded = []
+        SyncingS3Client.deleted = []
+        SyncingS3Client.put_objects = []
+        return self.backend.sync_project_content(
+            "hpi-analytics", self.project_root, revision
         )
 
     def test_sync_uploads_only_what_differs(self):
         (self.project_data / "extra.csv").write_text("x,y\n1,2\n", encoding="utf-8")
-        self.stub.client_class = SyncingS3Client
         prices = self.project_data / "prices.csv"
-        SyncingS3Client.objects = {
+
+        changed = self._sync(objects={
             # Already current: same size and single-part ETag as the local file.
             "projects/hpi-analytics/data/prices.csv": {
                 "etag": _md5_of(prices),
@@ -626,18 +659,40 @@ class AgentCoreSandboxTests(SandboxTestCase):
             },
             # No longer present locally, so it must be removed.
             "projects/hpi-analytics/data/stale.csv": {"etag": "whatever", "size": 1},
-        }
-        SyncingS3Client.uploaded = []
-        SyncingS3Client.deleted = []
+        })
 
-        changed = self.backend.sync_project_data("hpi-analytics", self.project_data, 9)
-
-        self.assertEqual(SyncingS3Client.uploaded, ["projects/hpi-analytics/data/extra.csv"])
+        self.assertNotIn("projects/hpi-analytics/data/prices.csv", SyncingS3Client.uploaded)
+        self.assertIn("projects/hpi-analytics/data/extra.csv", SyncingS3Client.uploaded)
         self.assertEqual(SyncingS3Client.deleted, ["projects/hpi-analytics/data/stale.csv"])
-        self.assertEqual(changed, 2)
+        self.assertEqual(changed, len(SyncingS3Client.uploaded) + 1)
         # The revision marker is written last so a partial sync never looks current.
         self.assertEqual(SyncingS3Client.put_objects[-1][0], "projects/hpi-analytics/.revision")
         self.assertEqual(SyncingS3Client.put_objects[-1][1], b"9")
+
+    def test_sync_carries_skills_not_only_data(self):
+        """The agent builds its prompts from these, so they must travel with it."""
+        self._sync()
+
+        self.assertIn(
+            "projects/hpi-analytics/skills/pricing/SKILL.md", SyncingS3Client.uploaded
+        )
+
+    def test_sync_never_deletes_the_revision_marker(self):
+        """It lives inside the mirrored prefix and would otherwise look stale."""
+        self._sync(objects={"projects/hpi-analytics/.revision": {"etag": "x", "size": 1}})
+
+        self.assertEqual(SyncingS3Client.deleted, [])
+
+    def test_sync_skips_hidden_files(self):
+        """Deletes stage as '.<name>.deleted-<uuid>'; a tombstone is not content."""
+        (self.project_data / ".prices.csv.deleted-abc").write_text("x", encoding="utf-8")
+
+        self._sync()
+
+        self.assertFalse(
+            any(".deleted-" in key for key in SyncingS3Client.uploaded),
+            SyncingS3Client.uploaded,
+        )
 
     def test_project_data_current_compares_the_revision_marker(self):
         self.stub.client_class = SyncingS3Client
@@ -657,84 +712,182 @@ class AgentCoreSandboxTests(SandboxTestCase):
         )
 
 
-class DownloadingS3Client(StubClient):
-    """Serves a configurable key listing, as the staging prefix would."""
+class ArchiveReturningClient(StubClient):
+    """Serves a real tar.gz through readFiles, as a live session would."""
 
-    keys = []
-    downloaded = []
+    archive = b""
+    reported_size = None  # overrides the size the tar command prints
 
-    def get_paginator(self, name):
-        keys = type(self).keys
+    def invoke_code_interpreter(self, **kwargs):
+        self._record("invoke_code_interpreter", **kwargs)
+        if kwargs["name"] == "readFiles":
+            return {
+                "stream": [
+                    {
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "resource",
+                                    "resource": {
+                                        "blob": type(self).archive,
+                                        "mimeType": "application/x-tar",
+                                    },
+                                }
+                            ],
+                            "isError": False,
+                        }
+                    }
+                ]
+            }
+        stdout = ""
+        command = kwargs["arguments"].get("command", "")
+        if kwargs["name"] == "executeCommand" and "tar -czf" in command:
+            declared = type(self).reported_size
+            stdout = str(len(type(self).archive) if declared is None else declared)
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "content": [{"type": "text", "text": stdout or "ok"}],
+                        "structuredContent": {
+                            "stdout": stdout,
+                            "stderr": "",
+                            "exitCode": 0,
+                        },
+                        "isError": False,
+                    }
+                }
+            ]
+        }
 
-        class _Paginator:
-            def paginate(self, Bucket, Prefix):
-                yield {"Contents": [{"Key": f"{Prefix}{key}"} for key in keys]}
 
-        return _Paginator()
+def _tar_gz(files, symlinks=None):
+    """Build an archive in memory, including members tar would never produce."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+        for link, target in (symlinks or {}).items():
+            info = tarfile.TarInfo(link)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            archive.addfile(info)
+    return buffer.getvalue()
 
-    def download_file(self, bucket, key, filename):
-        type(self).downloaded.append(key)
-        Path(filename).write_text(f"contents of {key}", encoding="utf-8")
 
+class ArchiveExtractionTests(unittest.TestCase):
+    """Archive members are named by generated code and are not to be trusted.
 
-class HostileArtifactKeyTests(SandboxTestCase):
-    """Object keys are chosen inside the sandbox and are not to be trusted.
-
-    Generated code can read the run's scoped credentials out of the session
-    directory and call PutObject itself. The IAM resource ends in a wildcard, so
-    a key that climbs out of the run prefix still matches it; the boundary has
-    to hold on this side.
+    The sandbox builds this archive, so a member called '../../x' is as much a
+    write primitive as a crafted S3 key was under the previous transport.
     """
 
     def setUp(self):
-        super().setUp()
-        self.stub = StubBotoSession()
-        self.stub.client_class = DownloadingS3Client
-        DownloadingS3Client.downloaded = []
-        self.backend = AgentCoreSandbox(
-            region="us-east-1",
-            bucket="deepagents-test",
-            interpreter_id="deepagents-abc1234567",
-            data_access_role_arn="arn:aws:iam::111122223333:role/DeepAgentsSandboxData",
-            boto_session=self.stub,
-        )
-        self.destination = self.tmp_dir / "artifacts" / "u-alice" / "p-hpi" / "s-1" / "r-42"
-        self.outside = self.tmp_dir / "artifacts" / "escaped.txt"
+        self.tmp = Path(tempfile.mkdtemp(prefix="deep-agents-archive-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.destination = self.tmp / "run"
+        self.outside = self.tmp / "ESCAPED.txt"
 
-    def test_relative_traversal_is_refused(self):
-        DownloadingS3Client.keys = ["../../../escaped.txt"]
+    def test_ordinary_files_are_extracted(self):
+        data = _tar_gz({"./out/summary.csv": b"a,b\n1,2\n", "./module.py": b"x = 1\n"})
 
-        collected = self.backend.download_prefix("staging/run", self.destination)
-
-        self.assertEqual(collected, [])
-        self.assertFalse(self.outside.exists())
-
-    def test_absolute_key_is_refused(self):
-        """A doubled slash yields an absolute path, which replaces the join."""
-        DownloadingS3Client.keys = ["/tmp/escaped.txt"]
-
-        collected = self.backend.download_prefix("staging/run", self.destination)
-
-        self.assertEqual(collected, [])
-        self.assertFalse(Path("/tmp/escaped.txt").exists())
-
-    def test_ordinary_keys_are_still_collected(self):
-        DownloadingS3Client.keys = ["out/summary.csv", "module.py"]
-
-        collected = self.backend.download_prefix("staging/run", self.destination)
+        collected = extract_artifacts(data, self.destination)
 
         self.assertEqual(
-            sorted(path.relative_to(self.destination).as_posix() for path in collected),
-            ["module.py", "summary.csv"],
+            sorted(path.name for path in collected), ["module.py", "summary.csv"]
         )
+        # out/ is a convention, not a namespace.
+        self.assertTrue((self.destination / "summary.csv").is_file())
+        self.assertFalse((self.destination / "out").exists())
 
-    def test_a_refused_key_does_not_stop_the_rest(self):
-        DownloadingS3Client.keys = ["../escaped.txt", "out/summary.csv"]
+    def test_relative_traversal_is_refused(self):
+        data = _tar_gz({"../../ESCAPED.txt": b"planted"})
 
-        collected = self.backend.download_prefix("staging/run", self.destination)
+        self.assertEqual(extract_artifacts(data, self.destination), [])
+        self.assertFalse(self.outside.exists())
+
+    def test_absolute_member_is_refused(self):
+        data = _tar_gz({"/tmp/deep-agents-escaped.txt": b"planted"})
+
+        self.assertEqual(extract_artifacts(data, self.destination), [])
+        self.assertFalse(Path("/tmp/deep-agents-escaped.txt").exists())
+
+    def test_symlink_members_are_not_recreated(self):
+        data = _tar_gz({}, symlinks={"./out/link.txt": "/etc/passwd"})
+
+        self.assertEqual(extract_artifacts(data, self.destination), [])
+        self.assertFalse((self.destination / "link.txt").exists())
+
+    def test_a_refused_member_does_not_stop_the_rest(self):
+        data = _tar_gz({"../ESCAPED.txt": b"planted", "./out/summary.csv": b"ok\n"})
+
+        collected = extract_artifacts(data, self.destination)
 
         self.assertEqual([path.name for path in collected], ["summary.csv"])
         self.assertFalse(self.outside.exists())
+
+    def test_by_products_are_filtered_like_the_local_backend(self):
+        data = _tar_gz(
+            {
+                "./out/chart.png": b"\x89PNG",
+                "./data/prices.csv": b"do not collect",
+                "./pkg/__pycache__/mod.cpython-313.pyc": b"junk",
+                "./mod.pyc": b"junk",
+                "./.hidden": b"junk",
+                "./out/.hidden": b"junk",
+            }
+        )
+
+        collected = extract_artifacts(data, self.destination)
+
+        self.assertEqual([path.name for path in collected], ["chart.png"])
+
+    def test_identical_content_is_collected_once(self):
+        """Models routinely save a deliverable loose and again under out/."""
+        data = _tar_gz({"./chart.png": b"same-bytes", "./out/chart.png": b"same-bytes"})
+
+        collected = extract_artifacts(data, self.destination)
+
+        self.assertEqual([path.name for path in collected], ["chart.png"])
+
+    def test_same_name_different_content_is_kept_separately(self):
+        data = _tar_gz({"./chart.png": b"first", "./out/chart.png": b"second"})
+
+        collected = extract_artifacts(data, self.destination)
+
+        self.assertEqual(
+            sorted(path.name for path in collected), ["chart-1.png", "chart.png"]
+        )
+
+    def test_too_many_members_is_refused(self):
+        data = _tar_gz({f"./out/f{index}.txt": b"x" for index in range(6)})
+
+        with mock.patch.object(archive_module, "MAX_MEMBERS", 3):
+            with self.assertRaisesRegex(SandboxError, "more than 3 files"):
+                extract_artifacts(data, self.destination)
+
+    def test_decompression_bomb_is_refused(self):
+        data = _tar_gz({"./out/big.bin": b"x" * 4096})
+
+        with mock.patch.object(archive_module, "MAX_EXTRACTED_BYTES", 512):
+            with self.assertRaisesRegex(SandboxError, "expands to more than"):
+                extract_artifacts(data, self.destination)
+
+    def test_an_unreadable_archive_raises(self):
+        with self.assertRaisesRegex(SandboxError, "unreadable archive"):
+            extract_artifacts(b"not an archive at all", self.destination)
+
+    def test_no_staging_file_is_left_behind_on_failure(self):
+        """Artifact registration walks this directory; a stray dotfile would ship."""
+        data = _tar_gz({"./out/big.bin": b"x" * 4096})
+
+        with mock.patch.object(archive_module, "MAX_EXTRACTED_BYTES", 512):
+            with self.assertRaises(SandboxError):
+                extract_artifacts(data, self.destination)
+
+        self.assertEqual(list(self.destination.iterdir()), [])
 
 
 class SafeRelativePathTests(unittest.TestCase):

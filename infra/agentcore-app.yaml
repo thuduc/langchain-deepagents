@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Application-tier resources for the Deep Agents workspace: the LangGraph
+  checkpoint table and the permissions to use it.
+
+  Deliberately separate from agentcore-sandbox.yaml. That stack owns the VPC,
+  the DNS firewall and the data bucket, which change rarely and are expensive to
+  get wrong; this one holds what changes as the application evolves. Keeping
+  them apart means an application update can never put the network or the
+  bucket into a failed rollback.
+
+  It takes what it needs from the sandbox stack's Outputs as parameters rather
+  than Fn::ImportValue, which avoids creating a deletion dependency between the
+  two stacks.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: deepagents
+    Description: Prefix for resource names. Match the sandbox stack.
+
+  EnableDeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Protects the checkpoint table from deletion. This table holds every
+      conversation's memory, and losing it is silent: the transcript still
+      renders from the application database, so the only symptom is the agent
+      forgetting. Set to false only when you intend to tear the stack down.
+
+  AgentImageUri:
+    Type: String
+    Default: ""
+    Description: >
+      Image the agent runtime runs, e.g. <account>.dkr.ecr.<region>.amazonaws.com/deepagents-agent:latest.
+      Leave empty on the first deploy: the repository this stack creates has to
+      exist before there is anything to push, and the runtime cannot be created
+      without an image. Set it and deploy again.
+
+  SandboxApplicationPolicyArn:
+    Type: String
+    Default: ""
+    Description: >
+      The sandbox stack's ApplicationPolicyArn output. Grants the agent what it
+      needs to drive the code interpreter and read project content.
+
+  SandboxBucket:
+    Type: String
+    Default: ""
+    Description: The sandbox stack's SandboxBucket output.
+
+  CodeInterpreterId:
+    Type: String
+    Default: ""
+    Description: The sandbox stack's CodeInterpreterId output.
+
+  DataAccessRoleArn:
+    Type: String
+    Default: ""
+    Description: The sandbox stack's DataAccessRoleArn output.
+
+  PortkeyProviderSlug:
+    Type: String
+    Default: ""
+    Description: >
+      Model provider the gateway routes to, e.g. openai-prod. Deliberately has no
+      usable default: the application requires this and refuses to start without
+      it, and a real default here would satisfy that check with a value nobody
+      chose, leaving a runtime pointed at the wrong provider until the first
+      prompt failed. Empty is allowed only so the checkpoint table can be
+      deployed on its own; the rule below requires it alongside a gateway.
+    AllowedPattern: "^$|^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+    ConstraintDescription: A Portkey provider slug, e.g. openai-prod.
+
+  PortkeySecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Secrets Manager secret holding the gateway key. The ARN, not the
+      key: an environment variable is readable through GetAgentRuntime by anyone
+      with that permission, which broad read-only policies include, and passing
+      the key itself would also put it on a deploy command line and into shell
+      history and CI logs. The container reads the secret at startup instead, so
+      the value is never in the runtime's configuration and rotating it needs no
+      deployment. Leave empty only for a runtime that has no model gateway.
+
+# Enforced when the change set is built, so a runtime with a gateway but no
+# provider is rejected at deploy time. The application refuses to start in that
+# state; catching it here means the deployment fails rather than the container.
+Rules:
+  ProviderRequiredWithAGateway:
+    RuleCondition: !Not [!Equals [!Ref PortkeySecretArn, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PortkeyProviderSlug, ""]]
+        AssertDescription: >
+          PortkeyProviderSlug is required whenever PortkeySecretArn is set. It
+          names the provider the gateway routes to, and there is no safe default.
+
+Conditions:
+  ProtectTable: !Equals [!Ref EnableDeletionProtection, "true"]
+  HasAgentImage: !Not [!Equals [!Ref AgentImageUri, ""]]
+  HasSandboxPolicy: !Not [!Equals [!Ref SandboxApplicationPolicyArn, ""]]
+  HasPortkeySecret: !Not [!Equals [!Ref PortkeySecretArn, ""]]
+
+Resources:
+  # Schema is dictated by langgraph-checkpoint-aws (DynamoDBSaver): a single
+  # table keyed on PK/SK, both strings, with an optional numeric 'ttl' attribute.
+  # DynamoDB key schema cannot be altered after creation, so a change here means
+  # a replacement -- hence the Retain policies below.
+  CheckpointTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-checkpoints"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        # Enabled so CHECKPOINT_DDB_TTL_DAYS works if it is ever set. With no
+        # 'ttl' attribute written, nothing expires.
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      DeletionProtectionEnabled: !If [ProtectTable, true, false]
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # Attach alongside the sandbox stack's application policy. Kept as a separate
+  # managed policy so the sandbox stack never has to be touched again.
+  CheckpointAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-checkpoint-access"
+      Description: Read and write LangGraph checkpoints.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The saver deletes through BatchWriteItem rather than DeleteItem, and
+          # lists a thread's checkpoints with Query. It uses no secondary index.
+          - Sid: UseCheckpointTable
+            Effect: Allow
+            Action:
+              - "dynamodb:GetItem"
+              - "dynamodb:PutItem"
+              - "dynamodb:Query"
+              - "dynamodb:BatchGetItem"
+              - "dynamodb:BatchWriteItem"
+              - "dynamodb:DescribeTable"
+            Resource: !GetAtt CheckpointTable.Arn
+
+  # Where the agent image lives. Created here rather than by hand so the image
+  # and the runtime that references it share a lifecycle.
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-agent"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep the ten most recent images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": {"type": "expire"}
+            }]
+          }
+
+  # What the agent container runs as. Distinct from the interpreter's execution
+  # role, which holds nothing: this one runs code you wrote, the other is
+  # readable by code the model wrote.
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-agent-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Ref CheckpointAccessPolicy
+        - !If
+          - HasSandboxPolicy
+          - !Ref SandboxApplicationPolicyArn
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: AgentRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PullTheImage
+                Effect: Allow
+                Action:
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchGetImage"
+                  - "ecr:GetDownloadUrlForLayer"
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  # CreateLogGroup included deliberately: without it the
+                  # container has nowhere to write, and a startup failure leaves
+                  # no trace anywhere to diagnose it from.
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*"
+              - !If
+                - HasPortkeySecret
+                # Scoped to the one secret. Unlike an environment variable, every
+                # read of it is a CloudTrail event, so who fetched the key and
+                # when is answerable after the fact.
+                - Sid: ReadTheGatewayKey
+                  Effect: Allow
+                  Action: "secretsmanager:GetSecretValue"
+                  Resource: !Ref PortkeySecretArn
+                - !Ref AWS::NoValue
+
+  # The agent tier itself. Created only once an image exists to point it at.
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: HasAgentImage
+    Properties:
+      AgentRuntimeName: !Sub "${ProjectName}_agent"
+      Description: Deep Agents supervisor and skill subagents.
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref AgentImageUri
+      RoleArn: !GetAtt AgentExecutionRole.Arn
+      # PUBLIC, not VPC. This container runs code we wrote and needs one outbound
+      # call, to the model gateway. VPC mode here would mean a NAT gateway at
+      # roughly thirty dollars a month to reach an endpoint the application
+      # already talks to directly. The untrusted half -- the code interpreter --
+      # stays in a VPC with no egress, which is where isolation actually matters.
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      ProtocolConfiguration: HTTP
+      EnvironmentVariables:
+        AGENTCORE_REGION: !Ref AWS::Region
+        AGENTCORE_BUCKET: !Ref SandboxBucket
+        AGENTCORE_INTERPRETER_ID: !Ref CodeInterpreterId
+        AGENTCORE_DATA_ACCESS_ROLE_ARN: !Ref DataAccessRoleArn
+        CHECKPOINT_DDB_TABLE: !Ref CheckpointTable
+        # The ARN of the key, never the key. Everything in this block is readable
+        # through GetAgentRuntime, so nothing secret may appear here.
+        PORTKEY_API_KEY_SECRET_ARN: !Ref PortkeySecretArn
+        PORTKEY_PROVIDER_SLUG: !Ref PortkeyProviderSlug
+
+  # What the *caller* needs: your user while testing locally, the ECS task role
+  # once the web tier is deployed. Separate from the agent's own execution role,
+  # which is what the container runs as.
+  AgentInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: HasAgentImage
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-agent-invoke"
+      Description: Start runs on the agent runtime.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeTheAgent
+            Effect: Allow
+            Action: "bedrock-agentcore:InvokeAgentRuntime"
+            Resource:
+              - !GetAtt AgentRuntime.AgentRuntimeArn
+              - !Sub "${AgentRuntime.AgentRuntimeArn}/*"
+
+Outputs:
+  AgentInvokePolicyArn:
+    Condition: HasAgentImage
+    Description: Attach to whoever starts runs (your user, or the ECS task role)
+    Value: !Ref AgentInvokePolicy
+
+  AgentRuntimeArn:
+    Condition: HasAgentImage
+    Description: Set as AGENTCORE_RUNTIME_ARN
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+
+  AgentRepositoryUri:
+    Description: Push the agent image here; see Dockerfile.agent
+    Value: !GetAtt AgentRepository.RepositoryUri
+
+  AgentExecutionRoleArn:
+    Description: Pass as the runtime's execution role once an image exists
+    Value: !GetAtt AgentExecutionRole.Arn
+
+  CheckpointTableName:
+    Description: Set as CHECKPOINT_DDB_TABLE
+    Value: !Ref CheckpointTable
+
+  CheckpointAccessPolicyArn:
+    Description: Attach to the ECS task role, or to your user for local testing
+    Value: !Ref CheckpointAccessPolicy
+
+  EnvBlock:
+    Description: Copy these lines into your .env
+    Value: !Sub
+      - "DEEP_AGENTS_CHECKPOINTER=dynamodb CHECKPOINT_DDB_TABLE=${Table}"
+      - Table: !Ref CheckpointTable

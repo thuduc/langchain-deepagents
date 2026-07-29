@@ -68,6 +68,44 @@ No NAT gateway, no idle compute. Standing cost is roughly a dollar a month.
 | `deploy.sh` | creates or updates the stack, prints your `.env` values |
 | `sync-projects.sh` | first-time upload of `projects/*/data` to S3 |
 | `teardown.sh` | empties the bucket and deletes the stack |
+| `agentcore-app.yaml` | the application stack: checkpoint table, agent image repository, agent runtime |
+| `deploy-app.sh` | creates or updates that stack, prints your `.env` values |
+
+## Running the agent tier on AgentCore Runtime
+
+Also optional, and independent of the sandbox: this moves the agent *graph* off
+your host, where the sandbox setting only moves the model's generated code.
+
+```bash
+./infra/deploy-app.sh          # checkpoint table + image repository
+```
+
+That is deliberately the first of two passes — the runtime needs an image, and
+the repository has to exist before there is one to push. The script prints the
+`docker buildx` and `docker push` commands, then you re-run it with the image:
+
+```bash
+AGENT_IMAGE_URI=<uri>:latest \
+  PORTKEY_PROVIDER_SLUG=<your provider> \
+  PORTKEY_SECRET_ARN=<secret arn> \
+  ./infra/deploy-app.sh
+```
+
+It reads the sandbox stack's bucket, interpreter and data-access role itself, so
+there is nothing to copy between the two. Set `SANDBOX_STACK` if yours is not
+named `deepagents-sandbox`.
+
+**The gateway key is passed as a Secrets Manager ARN, never as the key.** A
+runtime's environment variables are readable through `GetAgentRuntime` by anyone
+with read access, and a key passed as a stack parameter also lands in shell
+history and CI logs. The container reads the secret at startup instead, so the
+value never appears in the runtime's configuration, every read is a CloudTrail
+event, and rotating the key needs no deployment. The script refuses a
+`PORTKEY_SECRET_ARN` that is not an ARN, which is the mistake worth catching.
+
+`PORTKEY_PROVIDER_SLUG` is required alongside it and has no default anywhere — a
+default would be a provider nobody chose, and the mistake would only surface when
+a prompt reached the gateway.
 
 ## Things to know
 

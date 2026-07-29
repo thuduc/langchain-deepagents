@@ -23,7 +23,7 @@ describe("Messages", () => {
   it("renders a scoped active-run status", () => {
     render(<Messages emptyText="Nothing yet" messages={[]} activeRun={{
       key: "p:s", projectId: "p", sessionId: "s", runId: "r",
-      status: "Working with project data…", partialResponse: "", streamConnected: true,
+      status: "Working with project data…", streamConnected: true,
       error: null,
     }} />);
     expect(screen.getByRole("status")).toHaveTextContent("Working with project data…");

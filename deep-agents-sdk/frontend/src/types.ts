@@ -74,7 +74,6 @@ export interface ActiveRun {
   sessionId: string;
   runId: string | null;
   status: string;
-  partialResponse: string;
   streamConnected: boolean;
   error: string | null;
 }

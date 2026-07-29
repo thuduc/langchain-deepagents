@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 #
-# Uploads each project's data/ folder so sandbox sessions can read it.
+# Uploads each project's content so the agent and its sandbox can read it.
 #
-# This is the manual stand-in for the sync that will eventually be triggered by
-# touch_project(bump_revision=True). Re-run it whenever project content changes,
-# otherwise the sandbox reads stale data.
+# The whole project tree, not only data/: skill prompts are built by reading
+# SKILL.md and the files under each skill's references/ directory, and the
+# agent's own file tools are rooted at the project directory.
+#
+# This is the manual stand-in for the sync the application performs after a
+# content change. Re-run it whenever project content changes outside the app,
+# otherwise a run reads a stale mirror.
 #
 #   ./infra/sync-projects.sh
 #
@@ -36,22 +40,20 @@ FOUND=0
 for project_path in "${PROJECTS_DIR}"/*/; do
   [ -d "${project_path}" ] || continue
   slug="$(basename "${project_path}")"
-  data_dir="${project_path}data"
-
-  if [ ! -d "${data_dir}" ]; then
-    echo "  ${slug}: no data/ folder, skipped"
-    continue
-  fi
 
   echo "  ${slug}"
-  aws s3 sync "${data_dir}" "s3://${BUCKET}/projects/${slug}/data" \
+  # Hidden files are excluded on both sides of the application's own sync, and
+  # '.revision' is the marker it writes last; --delete must not remove it.
+  aws s3 sync "${project_path}" "s3://${BUCKET}/projects/${slug}" \
     --region "${REGION}" \
     --delete \
+    --exclude ".*" \
+    --exclude "*/.*" \
     --only-show-errors
   FOUND=$((FOUND + 1))
 done
 
-[ "${FOUND}" -gt 0 ] || fail "No projects with a data/ folder were found in ${PROJECTS_DIR}"
+[ "${FOUND}" -gt 0 ] || fail "No projects were found in ${PROJECTS_DIR}"
 
 printf "\033[1m%s project(s) synced\033[0m\n" "${FOUND}"
 aws s3 ls "s3://${BUCKET}/projects/" --recursive --human-readable --summarize \

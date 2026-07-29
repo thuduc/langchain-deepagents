@@ -35,6 +35,20 @@ export default defineConfig({
       DEEP_AGENTS_DB_DIR: join(e2eRoot, "databases"),
       DEEP_AGENTS_GENERATED_DIR: join(e2eRoot, "generated"),
       DEEP_AGENTS_DEV_LOGIN_ENABLED: "true",
+      // Every backend pinned to its local implementation, and the model gateway
+      // switched off. The server reads .env for anything the environment does
+      // not already set, so without these a developer whose .env points at AWS
+      // would have this suite deploy nothing but still talk to a real bucket, a
+      // real code interpreter and a real model gateway -- billing their account
+      // to run browser tests, and writing into shared project storage.
+      // Empty strings count as set, which is what keeps .env from filling them.
+      DEEP_AGENTS_SANDBOX: "local",
+      DEEP_AGENTS_ARTIFACT_STORE: "local",
+      DEEP_AGENTS_CHECKPOINTER: "sqlite",
+      DEEP_AGENTS_CANCELLATION: "local",
+      DEEP_AGENTS_AGENT_TRANSPORT: "local",
+      PORTKEY_API_KEY: "",
+      PORTKEY_API_KEY_SECRET_ARN: "",
     },
   },
 });

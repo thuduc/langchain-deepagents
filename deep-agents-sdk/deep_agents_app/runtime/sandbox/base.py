@@ -133,8 +133,14 @@ class SandboxBackend(ABC):
     def open_session(self, spec: SessionSpec) -> SandboxSession:
         """Provision a session and hydrate it with the project's data."""
 
-    def sync_project_data(self, project_slug: str, data_dir: Path, revision: int) -> int:
-        """Make the backend's copy of a project's data current.
+    def sync_project_content(
+        self, project_slug: str, project_root: Path, revision: int
+    ) -> int:
+        """Make the backend's copy of a project's content current.
+
+        The whole project tree, not just its data: the agent's own file tools are
+        rooted at the project directory, and its prompts are built by reading the
+        skill definitions under it.
 
         Returns the number of objects changed. Backends that read the project
         directory directly have nothing to do; only remote ones override this.
@@ -210,28 +216,21 @@ def safe_relative_path(raw: str) -> Optional[Path]:
     return Path(*parts)
 
 
+def is_hidden_relative(relative: str) -> bool:
+    """Whether any segment of a relative key or path is a dot name.
+
+    The rule that decides what the project mirror carries, and it has to be the
+    same rule everywhere it is applied: on the upload side a hidden file is never
+    written and never counted as stale, and on the download side it is never
+    fetched and never counted as content. Two copies of this that drifted apart
+    would leave one side deleting what the other had just written.
+    """
+    return any(part.startswith(".") for part in relative.split("/") if part)
+
+
 def is_timeout(stdout: str, stderr: str, exit_code: int) -> bool:
     """Detect a timeout from either the exit status or the bootstrap's marker."""
     return exit_code == 124 or TIMEOUT_SENTINEL in stderr or TIMEOUT_SENTINEL in stdout
-
-
-def run_prefix(spec: SessionSpec) -> str:
-    """The per-run path segment, also carried as a single IAM session tag.
-
-    Kept as one value rather than four because AWS packs session tags and the
-    session policy into one small budget, and four separate tags overflows it.
-    """
-    return f"{spec.user_id}/{spec.project_id}/{spec.session_id}/{spec.run_id}"
-
-
-def staging_prefix(spec: SessionSpec) -> str:
-    """Where the sandbox uploads, which is deliberately not where artifacts live.
-
-    Generated code holds credentials that can write here. Keeping that separate
-    from the artifacts/ namespace the download route serves means the server
-    decides what becomes a retrievable artifact; the sandbox cannot plant one.
-    """
-    return f"staging/{run_prefix(spec)}"
 
 
 # Executed inside the sandbox by both backends so that resource limits, the
@@ -334,6 +333,39 @@ finally:
 '''
 
 
+def is_collectable(relative: Path) -> bool:
+    """Whether a path inside work/ is a deliverable rather than a by-product.
+
+    Both backends apply this to the same relative path, so a file collected
+    locally is collected remotely and vice versa. Keeping the rule in one place
+    is what stops the two from disagreeing about, say, a dotfile at the root of
+    the working directory.
+    """
+    parts = relative.parts
+    if not parts:
+        return False
+    if parts[0] == DATA_DIR:
+        return False  # project inputs, hydrated in rather than produced
+    if any(part.startswith(".") or part in NON_ARTIFACT_DIRS for part in parts):
+        return False
+    return relative.suffix not in NON_ARTIFACT_SUFFIXES
+
+
+def artifact_relative_path(relative: Path) -> Optional[Path]:
+    """Where a file found under work/ should land, or None if it is not output.
+
+    out/ is a convention rather than a namespace: 'out/chart.png' is presented
+    as 'chart.png', which is also what a bare relative savefig() produces. The
+    two spell the same deliverable and must not become two artifacts.
+    """
+    if not is_collectable(relative):
+        return None
+    parts = relative.parts
+    if parts[0] == OUTPUT_DIR:
+        parts = parts[1:]
+    return Path(*parts) if parts else None
+
+
 def collectable_files(root: Path) -> List[Path]:
     """Files the run produced: everything under work/ except the project inputs.
 
@@ -344,15 +376,11 @@ def collectable_files(root: Path) -> List[Path]:
     work_root = root / WORK_DIR
     if not work_root.is_dir():
         return []
-    data_root = work_root / DATA_DIR
     collected = []
     for path in sorted(work_root.rglob("*")):
         if not path.is_file() or path.is_symlink():
             continue
-        if data_root in path.parents or path.suffix in NON_ARTIFACT_SUFFIXES:
-            continue
-        parts = path.relative_to(work_root).parts
-        if any(part.startswith(".") or part in NON_ARTIFACT_DIRS for part in parts):
+        if not is_collectable(path.relative_to(work_root)):
             continue
         collected.append(path)
     return collected

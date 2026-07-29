@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1
+#
+# The agent tier, packaged for AgentCore Runtime.
+#
+# Must be linux/arm64: Runtime accepts no other architecture. Build with
+#   docker buildx build --platform linux/arm64 -f Dockerfile.agent .
+#
+# Deliberately not the same image as the web application. This one carries no
+# frontend, no project content and no application database -- it holds the graph,
+# the sandbox client and the model client, and nothing that implies a user.
+
+FROM --platform=linux/arm64 public.ecr.aws/amazonlinux/amazonlinux:2023 AS python-builder
+
+RUN dnf -y upgrade \
+    && dnf -y install \
+        gcc \
+        gcc-c++ \
+        make \
+        python3.13 \
+        python3.13-devel \
+        python3.13-pip \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+RUN python3.13 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+COPY deep-agents-sdk/requirements.txt /tmp/requirements.txt
+
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir --requirement /tmp/requirements.txt
+
+
+FROM --platform=linux/arm64 public.ecr.aws/amazonlinux/amazonlinux:2023 AS runtime
+
+RUN dnf -y upgrade \
+    && dnf -y install \
+        fontconfig \
+        libgomp \
+        python3.13 \
+        shadow-utils \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+RUN groupadd --system --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid app --home-dir /app --shell /sbin/nologin app \
+    && mkdir -p /app/deep-agents-sdk /app/runtime /tmp/matplotlib \
+    && chown -R app:app /app /tmp/matplotlib
+
+COPY --from=python-builder /opt/venv /opt/venv
+
+COPY --chown=app:app \
+    deep-agents-sdk/deep_agents_app/ \
+    /app/deep-agents-sdk/deep_agents_app/
+
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    # Project content is read from S3, not from a directory in this image.
+    PROJECTS_DIR=/app/runtime/projects \
+    DEEP_AGENTS_DB_DIR=/app/runtime/databases \
+    DEEP_AGENTS_GENERATED_DIR=/app/runtime/generated \
+    # Conversation memory must be reachable from a microVM that owns no disk.
+    DEEP_AGENTS_CHECKPOINTER=dynamodb \
+    DEEP_AGENTS_CANCELLATION=dynamodb \
+    # Generated code belongs in its own microVM even here.
+    DEEP_AGENTS_SANDBOX=agentcore \
+    PORT=8080
+
+WORKDIR /app/deep-agents-sdk
+
+USER app
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8080') + '/ping', timeout=3)" || exit 1
+
+STOPSIGNAL SIGTERM
+
+# One worker: the graph cache and the sandbox session registry are per-process,
+# and a Runtime microVM serves one session at a time in any case.
+CMD ["sh", "-c", "exec python -m uvicorn deep_agents_app.runtime.agent_server:app --host 0.0.0.0 --port \"${PORT:-8080}\" --workers 1"]

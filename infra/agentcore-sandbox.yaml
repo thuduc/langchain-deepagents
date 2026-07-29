@@ -73,8 +73,9 @@ Resources:
             Status: Enabled
             Prefix: artifacts/
             NoncurrentVersionExpirationInDays: 30
-          # The sandbox uploads here and the server copies anything worth keeping
-          # into artifacts/. Nothing needs to survive the run that produced it.
+          # Nothing writes here any more: a run's output returns inline rather
+          # than through S3. The rule is kept because it is inert with no objects
+          # under it, and because an oversized-output fallback would stage here.
           - Id: ExpireSandboxStaging
             Status: Enabled
             Prefix: staging/
@@ -315,20 +316,11 @@ Resources:
                       - !Sub "projects/${!aws:PrincipalTag/slug}/*"
                   "Null":
                     "aws:PrincipalTag/slug": "false"
-              - Sid: WriteOwnRunOnly
-                Effect: Allow
-                Action:
-                  - "s3:PutObject"
-                  - "s3:AbortMultipartUpload"
-                # One tag, not four: AWS packs session tags and the session
-                # policy into a single small budget that four ids overflow. The
-                # value is path-shaped ("<user>/<project>/<session>/<run>") and
-                # server-derived, and IAM tag values cannot contain '*', so it
-                # cannot widen this ARN.
-                Resource: !Sub "${DataBucket.Arn}/staging/${!aws:PrincipalTag/run}/*"
-                Condition:
-                  "Null":
-                    "aws:PrincipalTag/run": "false"
+              # Deliberately no write statement. A run's output leaves the
+              # sandbox inline in the response to readFiles, not through S3, so
+              # these credentials are read-only. Generated code can read them out
+              # of the microVM's filesystem, which is why they are allowed to
+              # grant nothing beyond the project data the session already holds.
 
   # Permissions the application itself needs. Attach to the ECS task role, or to
   # your laptop user for local testing.

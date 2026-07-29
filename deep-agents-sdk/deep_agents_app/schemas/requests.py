@@ -67,11 +67,23 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
 
 
-class ChatResponse(BaseModel):
-    """A finished answer. Artifact links are already embedded in `response`."""
+class AgentInvocationRequest(BaseModel):
+    """One run, as the agent tier receives it.
 
-    response: str
-    project_id: str
-    session_id: str
-    run_id: str
-    duration_seconds: float
+    Every field is identity the web tier has already established. The agent tier
+    cannot authenticate anyone -- it has no user session and no database -- so it
+    accepts these as given, and is reachable only by the web tier.
+    """
+
+    user_id: str = Field(..., min_length=1, max_length=200)
+    project_id: str = Field(..., min_length=1, max_length=200)
+    session_id: str = Field(..., min_length=1, max_length=200)
+    run_id: str = Field(..., min_length=1, max_length=200)
+    prompt: str = Field(..., min_length=1, max_length=100_000)
+    # Project facts the agent cannot look up for itself. The slug is what it
+    # hydrates project files from object storage with, so it is constrained to
+    # the shape slugify() produces rather than accepted as free text.
+    project_name: str = Field(..., min_length=1, max_length=200)
+    project_slug: str = Field(..., min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    content_revision: int = Field(..., ge=0)
+    model: str = Field(..., min_length=1, max_length=200)

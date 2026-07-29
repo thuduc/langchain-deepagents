@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from deep_agents_app.api.routers import auth_router, chat_router, projects_router, sessions_router, settings_router
-from deep_agents_app.runtime import sandbox_runs
+from deep_agents_app.runtime import agent_client, checkpointer, sandbox_runs
 from deep_agents_app.runtime.sandbox import get_backend
 from deep_agents_app.services import artifact_store, workspace
 
@@ -16,22 +16,31 @@ from deep_agents_app.services import artifact_store, workspace
 async def app_lifespan(_: FastAPI):
     """Prepare the process at startup and release its resources at shutdown.
 
-    Building the sandbox backend and the artifact store here validates their
-    configuration while the process is still starting, so a misconfigured
+    Building the sandbox, the artifact store and the checkpointer here validates
+    their configuration while the process is still starting, so a misconfigured
     deployment fails visibly rather than on a user's first prompt.
     """
     workspace.init_db()
-    workspace.recover_interrupted_runs()
-    # Both of these preflight on first construction. Doing it at boot means a
-    # bad bucket or a missing role fails the deploy, not somebody's first run
-    # after it has already done all the work.
+    workspace.fail_abandoned_runs()
+    # Cheapest first, and the only one that reads no network: it checks that the
+    # configured pieces agree with each other, which is the failure the others
+    # cannot see. Each one below then checks reachability on construction. Doing
+    # it at boot means a bad bucket, a missing role or an absent table fails the
+    # deploy, not somebody's first run after it has already done all the work.
+    agent_client.preflight()
+    workspace.preflight_model_gateway()
     get_backend()
     artifact_store.get_store()
+    checkpointer.preflight()
     try:
         yield
     finally:
         sandbox_runs.close_all_sessions()
         workspace.invalidate_all_agents()
+        # Last, and after the sessions are gone: these runs are over, and saying
+        # so now is what spares them the heartbeat timeout that a hard kill has
+        # to wait out. Only this process's own.
+        workspace.release_owned_runs()
 
 
 async def security_headers(request: Request, call_next):

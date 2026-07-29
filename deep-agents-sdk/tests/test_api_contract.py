@@ -46,7 +46,6 @@ EXPECTED_API_OPERATIONS = {
     ("GET", "/api/projects/{project_id}/sessions/{session_id}/runs"),
     ("DELETE", "/api/projects/{project_id}/sessions/{session_id}"),
     ("GET", "/api/artifacts/{artifact_id}"),
-    ("POST", "/api/chat"),
     ("POST", "/api/chat/stream"),
 }
 

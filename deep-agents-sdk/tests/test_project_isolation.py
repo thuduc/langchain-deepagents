@@ -1,8 +1,10 @@
 import io
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -29,7 +31,11 @@ class MultiUserIsolationTests(unittest.TestCase):
         # happens to say on the machine running it.
         sandbox_env = patch.dict(
             os.environ,
-            {"DEEP_AGENTS_SANDBOX": "local", "DEEP_AGENTS_ARTIFACT_STORE": "local"},
+            {
+                "DEEP_AGENTS_SANDBOX": "local",
+                "DEEP_AGENTS_ARTIFACT_STORE": "local",
+                "DEEP_AGENTS_CHECKPOINTER": "sqlite",
+            },
         )
         sandbox_env.start()
         self.addCleanup(sandbox_env.stop)
@@ -111,6 +117,15 @@ class MultiUserIsolationTests(unittest.TestCase):
         response = self.client.get("/api/auth/me", headers=headers)
         self.assertEqual(response.status_code, 200)
         return response.json()["user"]["id"]
+
+    def _final_event(self, stream_text):
+        """The payload of the `final` event in a chat stream."""
+        for block in stream_text.split("\n\n"):
+            lines = block.splitlines()
+            if "event: final" in lines:
+                data = next(line for line in lines if line.startswith("data: "))
+                return json.loads(data[len("data: "):])
+        self.fail("The stream contained no final event")
 
     def test_api_requires_well_formed_cdx_identity(self):
         self.assertEqual(self.client.get("/api/projects").status_code, 401)
@@ -598,17 +613,38 @@ class MultiUserIsolationTests(unittest.TestCase):
             404,
         )
 
-    def test_non_streaming_chat_records_private_run(self):
+    def test_streaming_chat_completes_run(self):
         response = self.client.post(
-            "/api/chat",
+            "/api/chat/stream",
+            headers=self.user1_headers,
+            json={"project_id": "hpi-analytics", "message": "stream hello"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: run", response.text)
+        self.assertIn("event: final", response.text)
+        # The answer travels once, in `final`. Partial text is deliberately never
+        # sent: it would carry artifact paths that are not links until the run is
+        # over, so there is nothing safe to show mid-run.
+        self.assertNotIn("event: delta", response.text)
+        final = self._final_event(response.text)
+        self.assertTrue(final["run_id"])
+        self.assertGreaterEqual(final["duration_seconds"], 0)
+        user_id = self._user_id(self.user1_headers)
+        with server.get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM task_runs WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        self.assertEqual(row["status"], "completed")
+
+    def test_completed_run_is_private_to_its_owner(self):
+        response = self.client.post(
+            "/api/chat/stream",
             headers=self.user1_headers,
             json={"project_id": "hpi-analytics", "message": "hello"},
         )
         self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertTrue(body["run_id"])
-        self.assertGreaterEqual(body["duration_seconds"], 0)
-        session_id = body["session_id"]
+        session_id = self._final_event(response.text)["session_id"]
         session = self.client.get(
             f"/api/projects/hpi-analytics/sessions/{session_id}",
             headers=self.user1_headers,
@@ -621,24 +657,6 @@ class MultiUserIsolationTests(unittest.TestCase):
             ).status_code,
             404,
         )
-
-    def test_streaming_chat_completes_run(self):
-        response = self.client.post(
-            "/api/chat/stream",
-            headers=self.user1_headers,
-            json={"project_id": "hpi-analytics", "message": "stream hello"},
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("event: run", response.text)
-        self.assertIn("event: final", response.text)
-        self.assertIn('"duration_seconds":', response.text)
-        user_id = self._user_id(self.user1_headers)
-        with server.get_db_connection() as conn:
-            row = conn.execute(
-                "SELECT status FROM task_runs WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-        self.assertEqual(row["status"], "completed")
 
     def test_active_run_status_is_available_after_navigation(self):
         user_id = self._user_id(self.user1_headers)
@@ -685,21 +703,139 @@ class MultiUserIsolationTests(unittest.TestCase):
             "A project specialist is working with the data…",
         )
 
-    def test_startup_recovery_fails_interrupted_runs(self):
-        user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Interrupted")
-        run = server.create_task_run(
-            user_id, "hpi-analytics", session["id"], "unfinished work"
-        )
-        server.recover_interrupted_runs()
-
+    def _run_row(self, run_id):
         with server.get_db_connection() as conn:
-            row = conn.execute(
-                "SELECT status, error_summary FROM task_runs WHERE id = ?",
-                (run["id"],),
+            return conn.execute(
+                "SELECT status, error_summary FROM task_runs WHERE id = ?", (run_id,)
             ).fetchone()
+
+    def _heartbeat_at(self, run_id):
+        with server.get_db_connection() as conn:
+            return conn.execute(
+                "SELECT heartbeat_at FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()["heartbeat_at"]
+
+    def _start_run(self, title, prompt):
+        user_id = self._user_id(self.user1_headers)
+        session = server.create_session(user_id, "hpi-analytics", title)
+        return server.create_task_run(user_id, "hpi-analytics", session["id"], prompt)
+
+    def test_a_run_with_a_stale_heartbeat_is_failed(self):
+        run = self._start_run("Interrupted", "unfinished work")
+        stale = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET heartbeat_at = ? WHERE id = ?", (stale, run["id"])
+            )
+
+        self.assertEqual(server.fail_abandoned_runs(), 1)
+        row = self._run_row(run["id"])
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(
+            row["error_summary"], "The process running this task stopped responding"
+        )
+
+    def test_a_live_run_owned_by_another_process_is_left_alone(self):
+        """The regression this guards: a second web process starting up, or a
+        rolling deploy, used to fail every one of its peers' running tasks."""
+        run = self._start_run("Peer's work", "someone else is running this")
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET owner_id = ? WHERE id = ?",
+                ("a-different-process", run["id"]),
+            )
+
+        self.assertEqual(server.fail_abandoned_runs(), 0)
+        self.assertEqual(self._run_row(run["id"])["status"], "running")
+
+    def test_a_run_predating_the_owner_column_is_failed(self):
+        run = self._start_run("Legacy", "no owner recorded")
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET owner_id = NULL, heartbeat_at = NULL WHERE id = ?",
+                (run["id"],),
+            )
+
+        self.assertEqual(server.fail_abandoned_runs(), 1)
+        self.assertEqual(self._run_row(run["id"])["status"], "failed")
+
+    def test_shutdown_releases_this_process_own_runs_at_once(self):
+        """An ordinary restart must not make the user wait out the heartbeat."""
+        run = self._start_run("Interrupted", "unfinished work")
+
+        self.assertEqual(server.release_owned_runs(), 1)
+        row = self._run_row(run["id"])
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["error_summary"], "Server restarted during the run")
+
+    def test_shutdown_does_not_release_another_process_runs(self):
+        run = self._start_run("Peer's work", "someone else is running this")
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET owner_id = ? WHERE id = ?",
+                ("a-different-process", run["id"]),
+            )
+
+        self.assertEqual(server.release_owned_runs(), 0)
+        self.assertEqual(self._run_row(run["id"])["status"], "running")
+
+    def test_a_silent_run_is_still_kept_alive_by_its_heartbeat(self):
+        """The defect this covers: the heartbeat used to ride only on progress
+        events, so a run that reported nothing -- a long model call, or any run
+        at all on the AgentCore Runtime transport, which delivers no events
+        until it finishes -- aged into being swept up while still working."""
+        run = self._start_run("Silent", "a long, quiet model call")
+        stale = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET heartbeat_at = ? WHERE id = ?", (stale, run["id"])
+            )
+
+        # The real interval is minutes; injected here so a beat is observable.
+        heartbeat = server.start_run_heartbeat(run["id"], interval=0.05)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self._heartbeat_at(run["id"]) == stale:
+                time.sleep(0.05)
+            self.assertNotEqual(
+                self._heartbeat_at(run["id"]), stale, "the heartbeat never beat"
+            )
+            # Having beaten, the run survives a sweep it would otherwise fail.
+            self.assertEqual(server.fail_abandoned_runs(), 0)
+            self.assertEqual(self._run_row(run["id"])["status"], "running")
+        finally:
+            heartbeat.stop()
+
+    def test_the_heartbeat_stops_when_the_run_is_released(self):
+        run = self._start_run("Released", "finished work")
+        heartbeat = server.start_run_heartbeat(run["id"], interval=0.05)
+        time.sleep(0.2)
+        heartbeat.stop()
+
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET heartbeat_at = ? WHERE id = ?",
+                ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(), run["id"]),
+            )
+        time.sleep(0.3)  # a still-running thread would have refreshed it by now
+
+        self.assertEqual(server.fail_abandoned_runs(), 1)
+
+    def test_progress_reporting_keeps_a_run_from_being_reaped(self):
+        run = self._start_run("Long task", "a slow model call")
+        stale = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with server.get_db_connection() as conn:
+            conn.execute(
+                "UPDATE task_runs SET heartbeat_at = ? WHERE id = ?", (stale, run["id"])
+            )
+
+        # The same status twice: the write used to be skipped when the line
+        # repeated, which would have let a live run look abandoned.
+        server.update_task_run_activity(run["id"], "Working with project data…")
+        server.update_task_run_activity(run["id"], "Working with project data…")
+
+        self.assertEqual(server.fail_abandoned_runs(), 0)
+        self.assertEqual(self._run_row(run["id"])["status"], "running")
 
     def test_session_limit_is_per_user_and_project(self):
         user1_id = self._user_id(self.user1_headers)
@@ -793,7 +929,7 @@ print(output)
         token = server.CURRENT_RUN_CONTEXT.set(context)
         try:
             result = server.execute_python_code(
-                code, server.get_project_root("nmdb-analytics")
+                code, server.project_context("nmdb-analytics")
             )
         finally:
             server.CURRENT_RUN_CONTEXT.reset(token)
@@ -836,7 +972,7 @@ output.write_text("chart", encoding="utf-8")
 """
         token = server.CURRENT_RUN_CONTEXT.set(context)
         try:
-            server.execute_python_code(code, server.get_project_root("hpi-analytics"))
+            server.execute_python_code(code, server.project_context("hpi-analytics"))
         finally:
             server.CURRENT_RUN_CONTEXT.reset(token)
 

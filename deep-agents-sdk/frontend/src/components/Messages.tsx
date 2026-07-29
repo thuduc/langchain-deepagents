@@ -46,18 +46,19 @@ function Message({ message }: { message: ChatMessage }) {
   );
 }
 
+// No partial answer is shown while a run is in flight: the server holds the text
+// back until file references have been rewritten into authenticated links, so
+// there is nothing to render here but progress.
 function RunningMessage({ run }: { run: ActiveRun }) {
   return (
     <article className="message assistant streaming" data-run-key={run.key}>
       <div className="message-body">
-        {run.partialResponse ? <MarkdownContent text={run.partialResponse} /> : (
-          <div className="message-content">
-            <div className="agent-activity" role="status" aria-live="polite">
-              <span className="agent-activity-indicator"><span /><span /><span /></span>
-              <span>{run.status}</span>
-            </div>
+        <div className="message-content">
+          <div className="agent-activity" role="status" aria-live="polite">
+            <span className="agent-activity-indicator"><span /><span /><span /></span>
+            <span>{run.status}</span>
           </div>
-        )}
+        </div>
       </div>
     </article>
   );
@@ -67,7 +68,7 @@ export function Messages({ messages, activeRun, emptyText }: { messages: ChatMes
   const ref = useRef<HTMLElement>(null);
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [messages, activeRun?.status, activeRun?.partialResponse]);
+  }, [messages, activeRun?.status]);
   return (
     <section className="messages" ref={ref} aria-live="polite">
       {!messages.length && !activeRun ? <div className="empty-state"><p>{emptyText}</p></div> : null}

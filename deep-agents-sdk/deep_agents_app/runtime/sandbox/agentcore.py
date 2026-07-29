@@ -14,10 +14,11 @@ import hashlib
 import json
 import logging
 import os
-import uuid
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from deep_agents_app.runtime.sandbox.archive import extract_artifacts
 from deep_agents_app.runtime.sandbox.base import (
     BOOTSTRAP_SOURCE,
     CODE_FILE,
@@ -31,13 +32,9 @@ from deep_agents_app.runtime.sandbox.base import (
     SandboxSession,
     SessionSpec,
     clip_text,
-    file_digest,
+    is_hidden_relative,
     is_timeout,
-    run_prefix,
-    safe_relative_path,
     session_config,
-    staging_prefix,
-    unique_destination,
 )
 
 
@@ -46,6 +43,15 @@ logger = logging.getLogger(__name__)
 CREDENTIALS_FILE = ".aws-credentials"
 CONTENT_MD5_METADATA = "content-md5"
 DEFAULT_INTERPRETER = "aws.codeinterpreter.v1"
+
+# Where the sandbox builds the archive of one execution's output.
+ARCHIVE_FILE = "collect.tgz"
+
+# Ceiling on that archive. The service caps an InvokeCodeInterpreter response at
+# 24 MiB *after* base64 encoding, which costs a further third, leaving roughly
+# 18 MB of file content. 16 MiB keeps clear of that and of the response envelope,
+# whose size varies with the file name.
+MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 
 
 def _md5_hex(path: Path) -> str:
@@ -79,7 +85,6 @@ class AgentCoreSession(SandboxSession):
         self._session_id = session_id
         self._spec = spec
         self._closed = False
-        self._collected: set = set()
 
     def execute(self, code: str) -> ExecutionResult:
         """Write the code into the microVM and run the shared bootstrap over it."""
@@ -95,33 +100,26 @@ class AgentCoreSession(SandboxSession):
         return _result_to_execution(result)
 
     def collect_artifacts(self, destination: Path) -> List[Path]:
-        """Have the sandbox upload its output, then fetch it back.
+        """Pack the run's output in the sandbox, fetch it whole, and unpack it.
 
-            Uses the run's own scoped credentials for the upload, so the server never
-            needs to reach into the microVM's filesystem.
+        One archive returned inline, rather than per-object uploads to S3. That
+        is why the session's credentials carry no write permission at all: there
+        is no longer any path by which generated code can put bytes somewhere
+        the server later reads.
         """
-        prefix = staging_prefix(self._spec)
-        # 'cp --recursive' rather than 'sync': sync compares against the
-        # destination, which needs s3:ListBucket on the artifacts prefix. Copying
-        # only reads the local source, so the run's credentials never need list
-        # rights over anyone's artifacts, including their own.
-        self._backend.run_command(
-            self._session_id,
-            f"aws s3 cp --recursive {WORK_DIR} "
-            f"s3://{self._backend.bucket}/{prefix}/ "
-            f'--exclude "{DATA_DIR}/*" --exclude "*/.*" '
-            f'--exclude "*__pycache__/*" --exclude "*.pyc" --only-show-errors',
-            allow_empty_source=True,
-        )
-        # Collection runs after every execution, so skip keys already pulled down
-        # and clear the staging directory rather than re-uploading its contents.
-        collected = self._backend.download_prefix(prefix, destination, self._collected)
-        self._backend.run_command(
-            self._session_id,
-            f"find {WORK_DIR} -mindepth 1 -maxdepth 1 ! -name {DATA_DIR} "
-            f"-exec rm -rf {{}} + 2>/dev/null; mkdir -p {WORK_DIR}/{OUTPUT_DIR}; true",
-        )
-        return collected
+        size = self._backend.build_archive(self._session_id)
+        if size > MAX_ARCHIVE_BYTES:
+            # Deliberately raised before clearing the workspace, so the model can
+            # delete the offending files and collect again on the next execution.
+            raise SandboxError(self._backend.oversize_message(self._session_id, size))
+
+        data = self._backend.read_file_bytes(self._session_id, ARCHIVE_FILE)
+        try:
+            return extract_artifacts(data, destination)
+        finally:
+            # Collection runs after every execution, so the working directory is
+            # emptied to keep the next archive to what that execution produced.
+            self._backend.clear_workspace(self._session_id)
 
     def close(self) -> None:
         """Stop the session, which terminates the microVM and ends its billing."""
@@ -217,10 +215,12 @@ class AgentCoreSandbox(SandboxBackend):
             self.run_command(
                 session_id, f"mkdir -p {WORK_DIR}/{DATA_DIR} {WORK_DIR}/{OUTPUT_DIR}"
             )
+            # Only data/. The mirror holds the whole project, but generated code
+            # has no business reading skill definitions or anything else in it.
             self.run_command(
                 session_id,
                 f"aws s3 cp --recursive "
-                f"s3://{self.bucket}/projects/{spec.project_slug}/{DATA_DIR} "
+                f"s3://{self.bucket}/{self._project_prefix(spec.project_slug)}/{DATA_DIR} "
                 f"{WORK_DIR}/{DATA_DIR} --only-show-errors",
             )
         except Exception:
@@ -228,13 +228,16 @@ class AgentCoreSandbox(SandboxBackend):
             raise
         return session
 
-    # ----- project data replication ---------------------------------------
+    # ----- project content replication ------------------------------------
 
-    def _project_data_prefix(self, project_slug: str) -> str:
-        return f"projects/{project_slug}/{DATA_DIR}"
+    def _project_prefix(self, project_slug: str) -> str:
+        return f"projects/{project_slug}"
 
     def _revision_key(self, project_slug: str) -> str:
-        return f"projects/{project_slug}/.revision"
+        # Inside the mirrored prefix, but hidden, and hidden names are skipped on
+        # both sides of the comparison -- so the marker is never mistaken for
+        # stale content and deleted by the sync that is about to rewrite it.
+        return f"{self._project_prefix(project_slug)}/.revision"
 
     def project_data_current(self, project_slug: str, revision: int) -> bool:
         """Whether the S3 mirror already reflects this content revision."""
@@ -278,30 +281,45 @@ class AgentCoreSandbox(SandboxBackend):
             return True
         return head.get("Metadata", {}).get(CONTENT_MD5_METADATA) != digest
 
-    def sync_project_data(self, project_slug: str, data_dir: Path, revision: int) -> int:
-        """Mirror a project's data/ into S3, uploading only what differs."""
+    def sync_project_content(
+        self, project_slug: str, project_root: Path, revision: int
+    ) -> int:
+        """Mirror a project's whole tree into S3, uploading only what differs.
+
+        The whole tree rather than just data/, because that is what the agent can
+        actually reach: its FilesystemBackend is rooted at the project directory
+        and permitted to read anywhere under it. Skills in particular have to be
+        here, since prompts are built by reading SKILL.md and every file in the
+        skill's references/ directory.
+
+        Hydration remains selective. The sandbox is given only data/, and the
+        prefix layout keeps that easy to express.
+        """
         client = self._client("s3")
-        prefix = self._project_data_prefix(project_slug)
+        prefix = self._project_prefix(project_slug)
 
         remote: Dict[str, Dict[str, Any]] = {}
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=f"{prefix}/"):
             for entry in page.get("Contents", []):
-                remote[entry["Key"][len(prefix) + 1 :]] = {
+                relative = entry["Key"][len(prefix) + 1 :]
+                if is_hidden_relative(relative):
+                    continue  # the revision marker, and anything else internal
+                remote[relative] = {
                     "etag": entry.get("ETag", "").strip('"'),
                     "size": entry.get("Size", -1),
                 }
 
         local: Dict[str, Path] = {}
-        if data_dir.is_dir():
-            for path in sorted(data_dir.rglob("*")):
+        if project_root.is_dir():
+            for path in sorted(project_root.rglob("*")):
                 if not path.is_file() or path.is_symlink():
                     continue
-                relative = path.relative_to(data_dir)
+                relative = path.relative_to(project_root)
                 # Deletes rename to '.<name>.deleted-<uuid>' before committing, so a
                 # sync triggered mid-delete would otherwise replicate the tombstone.
-                # No hidden file is project data the sandbox should see.
-                if any(part.startswith(".") for part in relative.parts):
+                # No hidden file is project content the agent should see.
+                if is_hidden_relative(relative.as_posix()):
                     continue
                 local[relative.as_posix()] = path
 
@@ -364,12 +382,7 @@ class AgentCoreSandbox(SandboxBackend):
             {"content": [{"path": path, "text": text} for path, text in files.items()]},
         )
 
-    def run_command(
-        self,
-        session_id: str,
-        command: str,
-        allow_empty_source: bool = False,
-    ) -> Dict[str, Any]:
+    def run_command(self, session_id: str, command: str) -> Dict[str, Any]:
         """Run a shell command with the run's scoped AWS credentials in scope.
 
         Raises rather than returning quietly on failure, because a silent error
@@ -380,70 +393,108 @@ class AgentCoreSandbox(SandboxBackend):
             f"AWS_DEFAULT_REGION={self.region} {command}"
         )
         result = self.invoke(session_id, "executeCommand", {"command": scoped})
-        _raise_for_command_error(result, command, allow_empty_source)
+        _raise_for_command_error(result, command)
         return result
 
-    def download_prefix(
-        self, prefix: str, destination: Path, seen: Optional[set] = None
-    ) -> List[Path]:
-        """Fetch artifacts the sandbox uploaded. Keys in `seen` are skipped.
+    def build_archive(self, session_id: str) -> int:
+        """Pack work/ inside the sandbox and return the archive's size in bytes.
 
-        Object keys are treated as untrusted input. The upload runs inside the
-        sandbox with credentials scoped to this prefix, so generated code can
-        choose keys directly; one shaped like '../../etc/x' would otherwise be
-        joined onto the destination and write outside it.
+        Only the project inputs are excluded here, and only because they are
+        large; deciding what counts as a deliverable is left to extraction,
+        where the rule is shared with the local backend rather than expressed
+        as tar glob patterns whose semantics differ from Python's.
         """
-        destination.mkdir(parents=True, exist_ok=True)
-        client = self._client("s3")
-        paginator = client.get_paginator("list_objects_v2")
-        collected: List[Path] = []
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=f"{prefix}/"):
-            for entry in page.get("Contents", []):
-                key = entry["Key"]
-                if seen is not None and key in seen:
-                    continue
-                relative = safe_relative_path(key[len(prefix) + 1 :])
-                if relative is None:
-                    # Not merely unusual: nothing the upload command produces
-                    # looks like this, so the key was placed deliberately.
-                    logger.error(
-                        "Refusing artifact key that escapes the run prefix: %s", key
-                    )
-                    continue
-                if seen is not None:
-                    seen.add(key)
-                # out/ is a convention, not a namespace: match the local backend
-                # and present 'summary.csv' rather than 'out/summary.csv'.
-                if relative.parts[0] == OUTPUT_DIR:
-                    if len(relative.parts) == 1:
-                        continue  # the directory marker, not a file in it
-                    relative = Path(*relative.parts[1:])
+        result = self.run_command(
+            session_id,
+            f"rm -f {ARCHIVE_FILE}; "
+            f"tar -czf {ARCHIVE_FILE} -C {WORK_DIR} --exclude=./{DATA_DIR} . "
+            f"&& stat -c %s {ARCHIVE_FILE}",
+        )
+        return _last_integer(result)
 
-                # The bytes are needed before the destination can be chosen, since
-                # a duplicate is only detectable by content. Download beside the
-                # target, then either name it or discard it.
-                destination.mkdir(parents=True, exist_ok=True)
-                staged = destination / f".incoming-{uuid.uuid4().hex}"
-                client.download_file(self.bucket, key, str(staged))
-                target = unique_destination(destination, relative, file_digest(staged))
-                if target is None:
-                    staged.unlink(missing_ok=True)
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                staged.replace(target)
-                collected.append(target)
-        return collected
+    def read_file_bytes(self, session_id: str, path: str) -> bytes:
+        """Fetch one file from the session as raw bytes.
+
+        readFiles carries binary in the response's resource blob, so nothing
+        needs base64 encoding on the way out. The service caps the encoded
+        response at 24 MiB, which is why callers check the size beforehand.
+        """
+        response = self._client("bedrock-agentcore").invoke_code_interpreter(
+            codeInterpreterIdentifier=self.interpreter_id,
+            sessionId=session_id,
+            name="readFiles",
+            arguments={"paths": [path]},
+        )
+        chunks: List[bytes] = []
+        for event in response.get("stream", []):
+            result = event.get("result") or {}
+            if result.get("isError"):
+                text = " ".join(
+                    item.get("text", "") for item in result.get("content") or []
+                )
+                raise SandboxError(
+                    f"Could not read {path} from the sandbox: {text.strip()[:300]}"
+                )
+            for item in result.get("content") or []:
+                blob = (item.get("resource") or {}).get("blob") or item.get("data")
+                if blob:
+                    chunks.append(blob)
+        if not chunks:
+            raise SandboxError(f"Sandbox returned no content for {path}")
+        return b"".join(chunks)
+
+    def clear_workspace(self, session_id: str) -> None:
+        """Empty work/ except the project inputs, ready for the next execution."""
+        self.run_command(
+            session_id,
+            f"rm -f {ARCHIVE_FILE}; "
+            f"find {WORK_DIR} -mindepth 1 -maxdepth 1 ! -name {DATA_DIR} "
+            f"-exec rm -rf {{}} + 2>/dev/null; mkdir -p {WORK_DIR}/{OUTPUT_DIR}; true",
+        )
+
+    def oversize_message(self, session_id: str, size: int) -> str:
+        """Explain an over-limit collection in terms the model can act on.
+
+        Names the largest files, because the only useful response is to delete
+        or shrink them and run again. A bare size would leave the model guessing.
+        """
+        limit_mb = MAX_ARCHIVE_BYTES // (1024 * 1024)
+        message = (
+            f"Generated files total {size / (1024 * 1024):.1f} MB, over the "
+            f"{limit_mb} MB limit for one execution."
+        )
+        try:
+            result = self.run_command(
+                session_id,
+                f"find {WORK_DIR}/{OUTPUT_DIR} -type f -printf '%s %p\\n' 2>/dev/null "
+                f"| sort -rn | head -5",
+            )
+            listing = ((result.get("structured") or {}).get("stdout") or "").strip()
+        except SandboxError:
+            listing = ""
+        if listing:
+            message += f" Largest files:\n{listing}"
+        return message + " Remove or shrink them, then continue."
 
     # ----- identity -------------------------------------------------------
 
     def session_policy(self, spec: SessionSpec) -> Dict[str, Any]:
-        """Narrow the assumed role to one project and one run.
+        """Narrow the assumed role to reading one project's data directory.
 
-        Kept deliberately terse. AWS packs the session policy and the session tags
-        into one small budget, and exceeding it fails the AssumeRole call outright.
-        Sids, an explicit Version, and prefix conditions are all omitted because
-        the role's own tag-templated policy already enforces them; this document
-        is the second of two independent controls, not the only one.
+        Read-only, and deliberately so. Output no longer leaves the sandbox
+        through S3 — it comes back inline in the response to readFiles — so
+        these credentials grant access only to data the session was hydrated
+        with in the first place. Generated code can read them out of the
+        microVM, and holding them buys it nothing it did not already have.
+
+        Scoped to data/ rather than the whole project prefix, because the mirror
+        now carries skills and whatever else a project contains. The role's own
+        policy bounds a run to its project; this bounds it further to the one
+        part of that project the sandbox has any reason to read.
+
+        Kept terse because AWS packs the session policy and the session tags
+        into one small budget. This document is the second of two independent
+        controls; the role's own tag-templated policy is the first.
         """
         bucket_arn = f"arn:aws:s3:::{self.bucket}"
         return {
@@ -451,34 +502,28 @@ class AgentCoreSandbox(SandboxBackend):
                 {
                     "Effect": "Allow",
                     "Action": "s3:GetObject",
-                    "Resource": f"{bucket_arn}/projects/{spec.project_slug}/*",
+                    "Resource": (
+                        f"{bucket_arn}/{self._project_prefix(spec.project_slug)}"
+                        f"/{DATA_DIR}/*"
+                    ),
                 },
                 {
                     "Effect": "Allow",
                     "Action": "s3:ListBucket",
                     "Resource": bucket_arn,
                 },
-                {
-                    "Effect": "Allow",
-                    "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
-                    "Resource": f"{bucket_arn}/{staging_prefix(spec)}/*",
-                },
             ],
         }
 
     def session_tags(self, spec: SessionSpec) -> List[Dict[str, str]]:
-        """Tags the role's own policy templates on. These are the real boundary.
+        """The tag the role's own policy templates on. This is the real boundary.
 
-        Two tags, not five: AWS packs tags and the session policy into one small
-        budget, and five separate ids overflow it. The four run identifiers travel
-        as a single path-shaped value. IAM tag values cannot contain '*', and every
-        value here is server-derived, so the combined form cannot widen the ARN it
-        is substituted into.
+        One tag now. A second, path-shaped 'run' tag used to scope writes into a
+        per-run staging prefix; with no write path there is nothing left for it
+        to bound. IAM tag values cannot contain '*', and the slug is
+        server-derived, so it cannot widen the ARN it is substituted into.
         """
-        return [
-            {"Key": "slug", "Value": spec.project_slug},
-            {"Key": "run", "Value": run_prefix(spec)},
-        ]
+        return [{"Key": "slug", "Value": spec.project_slug}]
 
     def _scoped_credentials(self, spec: SessionSpec) -> Dict[str, str]:
         assumed = self._client("sts").assume_role(
@@ -504,6 +549,19 @@ class AgentCoreSandbox(SandboxBackend):
         return self._clients[service]
 
 
+def _last_integer(result: Dict[str, Any]) -> int:
+    """The last whole number a command printed, which is how sizes come back.
+
+    Reads the tail rather than the whole output so a warning on an earlier line
+    cannot be mistaken for the value.
+    """
+    text = (result.get("structured") or {}).get("stdout") or result.get("text", "")
+    matches = re.findall(r"\b\d+\b", text)
+    if not matches:
+        raise SandboxError(f"Sandbox did not report a size: {text.strip()[:200]!r}")
+    return int(matches[-1])
+
+
 def _drain(response: Dict[str, Any]) -> Dict[str, Any]:
     """Collapse an invoke_code_interpreter event stream into one result dict."""
     text_parts: List[str] = []
@@ -525,18 +583,11 @@ def _drain(response: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _raise_for_command_error(
-    result: Dict[str, Any], command: str, allow_empty_source: bool
-) -> None:
+def _raise_for_command_error(result: Dict[str, Any], command: str) -> None:
     """Surface a failed shell command instead of letting it pass silently."""
     structured = result.get("structured") or {}
     output = f"{result.get('text', '')}\n{structured.get('stderr', '')}"
     exit_code = structured.get("exitCode", 0)
-
-    # 'cp --recursive' over a directory with no files is a legitimate no-op for a
-    # run that produced no artifacts.
-    if allow_empty_source and "does not exist" in output:
-        return
 
     if result.get("is_error") or exit_code not in (0, None) or "fatal error" in output:
         raise SandboxError(

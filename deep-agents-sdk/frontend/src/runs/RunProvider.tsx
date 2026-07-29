@@ -92,7 +92,7 @@ export function RunProvider({ children }: PropsWithChildren) {
     setRuns((current) => current[key] ? current : {
       ...current,
       [key]: {
-        key, projectId, sessionId, runId, status: status || "Working…", partialResponse: "",
+        key, projectId, sessionId, runId, status: status || "Working…",
         streamConnected: false, error: null,
       },
     });
@@ -106,7 +106,7 @@ export function RunProvider({ children }: PropsWithChildren) {
     controllers.current.set(key, controller);
     const initial: ActiveRun = {
       key, projectId, sessionId, runId: null, status: "Preparing the agent workspace…",
-      partialResponse: "", streamConnected: false, error: null,
+      streamConnected: false, error: null,
     };
     runsRef.current = { ...runsRef.current, [key]: initial };
     setRuns((current) => ({ ...current, [key]: initial }));
@@ -120,11 +120,6 @@ export function RunProvider({ children }: PropsWithChildren) {
           });
         } else if (event.type === "status") {
           patchRun(key, { runId: String(data.run_id || runsRef.current[key]?.runId || ""), status: String(data.message || "Working…") });
-        } else if (event.type === "delta") {
-          const delta = String(data.text || "");
-          setRuns((current) => current[key] ? {
-            ...current, [key]: { ...current[key], partialResponse: `${current[key].partialResponse}${delta}` },
-          } : current);
         } else if (event.type === "final") {
           receivedFinal = true;
           remove(projectId, sessionId);

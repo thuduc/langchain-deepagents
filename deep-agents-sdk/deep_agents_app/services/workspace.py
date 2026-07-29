@@ -45,7 +45,7 @@ from deep_agents_app.config import (  # noqa: E402
     ensure_child_path as config_ensure_child_path,
     load_runtime_paths,
 )
-from deep_agents_app.domain import CurrentUser, RunContext  # noqa: E402
+from deep_agents_app.domain import CurrentUser, ProjectContext, RunContext  # noqa: E402
 from deep_agents_app.db import connect, initialize_schema  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -592,6 +592,23 @@ def get_project_root(project_id: str) -> Path:
     return Path(get_project(project_id)["path"])
 
 
+def project_context(project_id: str) -> ProjectContext:
+    """Assemble what the agent needs to know about a project, from the database.
+
+    The one place the two halves meet. Everything here is a query the agent
+    itself must not make, because it may be running where these tables are not.
+    """
+    project = get_project(project_id)
+    return ProjectContext(
+        id=project["id"],
+        name=project["name"],
+        slug=project["slug"],
+        root=Path(project["path"]),
+        content_revision=project["content_revision"],
+        model=get_app_settings()[SETTING_DEFAULT_MODEL],
+    )
+
+
 def get_skill_dir(project_id: str) -> Path:
     """The skills directory inside a project."""
     return get_project_root(project_id) / "skills"
@@ -734,7 +751,10 @@ def _sandbox_backend_name() -> str:
 
 
 def replicate_project_data(project_id: str) -> None:
-    """Push a project's data/ to wherever the sandbox reads it from.
+    """Push a project's content to wherever the agent and sandbox read it from.
+
+    The whole project tree, since the agent's file tools and its skill prompts
+    both read from it, not only the data the sandbox is hydrated with.
 
     A no-op for backends that read the project directory directly. Failures are
     logged rather than raised: the content change itself has already succeeded,
@@ -748,9 +768,9 @@ def replicate_project_data(project_id: str) -> None:
         with project_replication_lock(project_id):
             project = get_project(project_id)
             backend = get_backend()
-            changed = backend.sync_project_data(
+            changed = backend.sync_project_content(
                 project["slug"],
-                Path(project["path"]) / "data",
+                Path(project["path"]),
                 project["content_revision"],
             )
         if changed:
@@ -1002,7 +1022,16 @@ def validate_all_project_skills_once() -> None:
 
 def scan_project_skills(project_id: str) -> List[Dict[str, str]]:
     """Discover a project's skills and their descriptions."""
-    skills_dir = get_skill_dir(project_id)
+    return scan_skills(get_skill_dir(project_id))
+
+
+def scan_skills(skills_dir: Path) -> List[Dict[str, str]]:
+    """Discover skills in a directory, without needing to know whose it is.
+
+    Split out from scan_project_skills so the agent can read skills from a
+    directory hydrated out of object storage, where there is no project row to
+    look the path up from.
+    """
     skills: List[Dict[str, str]] = []
     if not skills_dir.exists():
         return skills
@@ -1142,11 +1171,14 @@ from deep_agents_app.services.sessions import (  # noqa: E402, F401
     create_task_run,
     delete_session_resources,
     ensure_no_active_project_runs,
+    fail_abandoned_runs,
     finish_task_run,
     get_session,
     maybe_title_session,
-    recover_interrupted_runs,
+    release_owned_runs,
     session_thread_id,
+    start_run_heartbeat,
+    touch_run_heartbeat,
     update_task_run_activity,
 )
 
@@ -1155,7 +1187,7 @@ from deep_agents_app.runtime.engine import (  # noqa: E402, F401
     execute_python_code,
     invalidate_project_agent,
     invalidate_all_agents,
-    run_agent,
+    preflight_model_gateway,
     task_status_from_event,
     stream_agent_events,
 )

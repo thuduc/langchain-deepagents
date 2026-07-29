@@ -33,7 +33,7 @@ _sessions_guard = threading.Lock()
 def session_for_run(
     context: RunContext,
     project_slug: str,
-    project_data_dir: Path,
+    project_root: Path,
     timeout_seconds: int,
     content_revision: int = 0,
 ) -> SandboxSession:
@@ -44,15 +44,15 @@ def session_for_run(
             return existing
 
     backend = get_backend()
-    # Safety net for the replication hook: a run must never read stale data, no
-    # matter what happened when the content was edited.
+    # Safety net for the replication hook: a run must never read stale content,
+    # no matter what happened when it was edited.
     if not backend.project_data_current(project_slug, content_revision):
         logger.info(
-            "Project %s data is not at revision %s in the sandbox backend; syncing",
+            "Project %s is not at revision %s in the sandbox backend; syncing",
             project_slug,
             content_revision,
         )
-        backend.sync_project_data(project_slug, project_data_dir, content_revision)
+        backend.sync_project_content(project_slug, project_root, content_revision)
 
     spec = SessionSpec(
         user_id=context.user_id,
@@ -60,7 +60,8 @@ def session_for_run(
         project_slug=project_slug,
         session_id=context.session_id,
         run_id=context.run_id,
-        project_data_dir=project_data_dir,
+        # The sandbox is hydrated with data/ only; the mirror holds more.
+        project_data_dir=project_root / "data",
         timeout_seconds=timeout_seconds,
     )
     session = backend.open_session(spec)

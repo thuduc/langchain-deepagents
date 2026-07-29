@@ -24,6 +24,40 @@ class RunContext:
 
 
 @dataclass(frozen=True)
+class ProjectContext:
+    """Everything about a project the agent needs in order to run.
+
+    Exists so the agent half can work without the application database. The web
+    tier reads these from its own tables and passes them along; an agent running
+    in a Runtime microVM receives them in the invocation and hydrates `root`
+    from object storage. Neither has to guess, and only one of them needs a
+    database.
+
+    `content_revision`, `name` and `model` together are also what makes a cached
+    graph stale: the first covers content and skill edits, the second a rename,
+    the third a settings change. Carrying them here means a cached graph can
+    check itself without a query.
+    """
+
+    id: str
+    name: str
+    slug: str
+    root: Path
+    content_revision: int
+    model: str
+
+    @property
+    def stamp(self) -> tuple:
+        """What a graph built from this project depends on."""
+        return (self.name, self.content_revision, self.model)
+
+    @property
+    def skills_dir(self) -> Path:
+        """Where this project's skill definitions live."""
+        return self.root / "skills"
+
+
+@dataclass(frozen=True)
 class CurrentUser:
     """The authenticated caller, resolved from the CDX token on every request.
 

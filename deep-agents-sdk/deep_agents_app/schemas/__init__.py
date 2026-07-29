@@ -1,8 +1,8 @@
 """Validated HTTP request and response schemas."""
 
 from .requests import (
+    AgentInvocationRequest,
     ChatRequest,
-    ChatResponse,
     ContentImportRequest,
     DevelopmentLoginRequest,
     ProjectCreateRequest,
@@ -14,7 +14,7 @@ from .requests import (
 )
 
 __all__ = [
-    "ChatRequest", "ChatResponse", "ContentImportRequest", "DevelopmentLoginRequest",
+    "AgentInvocationRequest", "ChatRequest", "ContentImportRequest", "DevelopmentLoginRequest",
     "ProjectCreateRequest", "ProjectFolderCreateRequest", "ProjectImportRequest", "ProjectUpdateRequest",
     "SessionCreateRequest", "SettingsUpdateRequest",
 ]

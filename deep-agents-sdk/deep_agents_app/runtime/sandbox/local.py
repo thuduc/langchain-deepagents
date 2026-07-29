@@ -39,6 +39,7 @@ from deep_agents_app.runtime.sandbox.base import (
     SandboxSession,
     WORK_DIR,
     SessionSpec,
+    artifact_relative_path,
     clip_stream,
     collectable_files,
     file_digest,
@@ -338,10 +339,9 @@ class LocalSandboxSession(SandboxSession):
         work_root = self._root / WORK_DIR
         collected: List[Path] = []
         for source in collectable_files(self._root):
-            relative = source.relative_to(work_root)
-            # out/ is a convention, not a namespace: don't nest it in the result.
-            if relative.parts and relative.parts[0] == OUTPUT_DIR:
-                relative = Path(*relative.parts[1:])
+            relative = artifact_relative_path(source.relative_to(work_root))
+            if relative is None:
+                continue
             target = unique_destination(destination, relative, file_digest(source))
             if target is None:
                 source.unlink(missing_ok=True)  # same bytes already collected

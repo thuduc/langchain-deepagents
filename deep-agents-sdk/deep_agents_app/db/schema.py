@@ -9,7 +9,7 @@ because project content is shared.
 import sqlite3
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
     latest_status TEXT NOT NULL DEFAULT 'Preparing the agent workspace…',
     prompt TEXT NOT NULL, error_summary TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+    -- Which process is driving this run, and when it last said so. Together
+    -- they are what lets one process tell a run abandoned by a dead peer from
+    -- one another peer is still working on. See services/sessions.py.
+    owner_id TEXT, heartbeat_at TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -87,6 +91,15 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_owner_run
     ON artifacts(user_id, run_id, created_at);
 """
 
+# Indexes over columns added after the first release. These cannot live in
+# SCHEMA_SQL: on an existing database CREATE TABLE IF NOT EXISTS is a no-op, so
+# the column is not there yet when that script runs and the index fails to
+# build. They are created below instead, once the ALTER TABLE patches have run.
+MIGRATED_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_runs_liveness
+    ON task_runs(status, heartbeat_at);
+"""
+
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
     """Create the schema if absent and apply in-place migrations.
@@ -104,6 +117,13 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE task_runs ADD COLUMN latest_status TEXT NOT NULL "
             "DEFAULT 'Preparing the agent workspace…'"
         )
+    # Left nullable rather than backfilled: a run already in the table predates
+    # this process, so a NULL owner is the truth about it, and the sweep reads
+    # it as exactly that -- abandoned.
+    for column in ("owner_id", "heartbeat_at"):
+        if column not in task_run_columns:
+            connection.execute(f"ALTER TABLE task_runs ADD COLUMN {column} TEXT")
+    connection.executescript(MIGRATED_INDEX_SQL)
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", (SCHEMA_VERSION,)
     )

@@ -1,6 +1,6 @@
 {
   "index.html": {
-    "file": "assets/index-B3yDviZg.js",
+    "file": "assets/index-BR1M-lSI.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
@@ -310,7 +310,7 @@
     "src": "node_modules/katex/dist/fonts/KaTeX_Typewriter-Regular.woff2"
   },
   "node_modules/pdfjs-dist/build/pdf.mjs": {
-    "file": "assets/pdf-C_jXBE9n.js",
+    "file": "assets/pdf-BhAyoHgx.js",
     "name": "pdf",
     "src": "node_modules/pdfjs-dist/build/pdf.mjs",
     "isDynamicEntry": true,
