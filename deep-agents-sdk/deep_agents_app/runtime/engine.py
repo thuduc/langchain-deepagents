@@ -1,36 +1,43 @@
+import asyncio
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
+
+from starlette.concurrency import run_in_threadpool
 
 from deep_agents_app.domain import RunContext
 from deep_agents_app.services import workspace as service_state
-from deep_agents_app.services.workspace import (
+from deep_agents_app.services.artifacts import (
+    prepare_response_artifacts,
+    register_run_artifacts,
+    unique_artifact_path,
+)
+from deep_agents_app.services.sessions import (
     add_chat_message,
-    bounded_env_int,
     cleanup_run_work,
-    ensure_child_path,
     finish_task_run,
+    session_thread_id,
+    update_task_run_activity,
+)
+from deep_agents_app.services.workspace import (
+    bounded_env_int,
+    ensure_child_path,
     get_app_settings,
     get_project,
     get_project_root,
     logger,
-    prepare_response_artifacts,
     project_artifact_context,
     project_filesystem_permission_specs,
     project_skills_source,
-    register_run_artifacts,
     scan_project_skills,
-    session_thread_id,
-    unique_artifact_path,
-    update_task_run_activity,
 )
 
 
@@ -49,10 +56,19 @@ def message_content_to_text(content: Any) -> str:
 
 
 def python_binary() -> str:
-    candidate = service_state.SDK_DIR / "venv" / "bin" / "python"
-    if candidate.exists():
-        return str(candidate)
-    raise RuntimeError("SDK virtual environment python binary not found at deep-agents-sdk/venv/bin/python")
+    """Return the interpreter used to run generated Python.
+
+    The server's own interpreter is the correct one: requirements.txt installs
+    pandas, matplotlib, and openpyxl into whichever environment runs the
+    application. Deriving the path from the source tree instead assumes the
+    virtual environment sits beside the code, which is false for any deployment
+    that builds it elsewhere — the container image creates it at /opt/venv, so
+    the previous lookup could never succeed there and every generated-code tool
+    call failed.
+    """
+    if not sys.executable:
+        raise RuntimeError("No Python interpreter is available to run generated code")
+    return sys.executable
 
 
 ProjectTreeSnapshot = Dict[str, tuple[str, int, int]]
@@ -352,21 +368,39 @@ def response_text_from_agent_result(result: Dict[str, Any]) -> str:
 class AgentRuntime:
     graph: Any
     checkpointer: Any
-    connection: sqlite3.Connection
+    connection: Any
 
 
 _agent_graphs: Dict[str, AgentRuntime] = {}
 _agent_graph_lock = threading.RLock()
 
 
+def close_checkpoint_connection(connection: Any) -> None:
+    """Close an aiosqlite connection from either a sync or async caller.
+
+    Its worker thread is not a daemon, so an abandoned connection would keep the
+    process from exiting. aiosqlite resolves each operation on the loop that
+    issued it, so closing from a fresh loop is safe even though the connection
+    was opened on a different one.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    try:
+        if running is not None:
+            running.create_task(connection.close())
+        else:
+            asyncio.run(connection.close())
+    except Exception as exc:
+        logger.warning("Could not close checkpoint connection: %s", exc)
+
+
 def invalidate_project_agent(project_id: str) -> None:
     with _agent_graph_lock:
         runtime = _agent_graphs.pop(project_id, None)
     if runtime:
-        try:
-            runtime.connection.close()
-        except Exception as exc:
-            logger.warning("Could not close checkpoint connection for %s: %s", project_id, exc)
+        close_checkpoint_connection(runtime.connection)
 
 
 def invalidate_all_agents() -> None:
@@ -374,32 +408,42 @@ def invalidate_all_agents() -> None:
         invalidate_project_agent(project_id)
 
 
-def delete_checkpoint_thread(thread_id: str) -> None:
-    if not service_state.AGENT_CHECKPOINT_DB_PATH.exists():
-        return
-    from langgraph.checkpoint.sqlite import SqliteSaver
-
-    conn = sqlite3.connect(service_state.AGENT_CHECKPOINT_DB_PATH, timeout=10, check_same_thread=False)
-    try:
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        saver = SqliteSaver(conn)
-        saver.setup()
-        saver.delete_thread(thread_id)
-    finally:
-        conn.close()
+async def aclose_all_agents() -> None:
+    """Await every checkpoint connection closed, for orderly application shutdown."""
+    for project_id in list(_agent_graphs):
+        with _agent_graph_lock:
+            runtime = _agent_graphs.pop(project_id, None)
+        if not runtime:
+            continue
+        try:
+            await runtime.connection.close()
+        except Exception as exc:
+            logger.warning("Could not close checkpoint connection for %s: %s", project_id, exc)
 
 
-def get_agent_graph(project_id: str):
-    with _agent_graph_lock:
-        cached = _agent_graphs.get(project_id)
-        if cached:
-            return cached.graph
+async def create_checkpointer():
+    """Open the async checkpoint store.
 
+    ``astream`` and ``ainvoke`` require an async checkpointer; the synchronous
+    ``SqliteSaver`` raises rather than falling back to a thread.
+    """
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    service_state.AGENT_CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = await aiosqlite.connect(service_state.AGENT_CHECKPOINT_DB_PATH)
+    await connection.execute("PRAGMA journal_mode = WAL;")
+    await connection.execute("PRAGMA busy_timeout = 5000;")
+    checkpointer = AsyncSqliteSaver(connection)
+    await checkpointer.setup()
+    return checkpointer, connection
+
+
+def build_project_graph(project_id: str, checkpointer: Any):
+    """Assemble a project's agent graph. Synchronous and slow; call off the loop."""
     from langchain_core.tools import tool
     from deepagents import FilesystemPermission, create_deep_agent
     from deepagents.backends import FilesystemBackend
-    from langgraph.checkpoint.sqlite import SqliteSaver
 
     project = get_project(project_id)
     project_root = Path(project["path"])
@@ -431,13 +475,7 @@ def get_agent_graph(project_id: str):
     specialist_tools = [execute_python, get_project_context]
     subagents = build_skill_subagents(project_id, skills, specialist_tools)
 
-    service_state.AGENT_CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(service_state.AGENT_CHECKPOINT_DB_PATH, timeout=10, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    checkpointer = SqliteSaver(conn)
-
-    graph = create_deep_agent(
+    return create_deep_agent(
         model=llm,
         tools=[],
         skills=skills,
@@ -447,28 +485,47 @@ def get_agent_graph(project_id: str):
         system_prompt=get_supervisor_system_prompt(project_id),
         checkpointer=checkpointer,
     )
-    runtime = AgentRuntime(graph=graph, checkpointer=checkpointer, connection=conn)
+
+
+async def get_agent_graph(project_id: str):
+    with _agent_graph_lock:
+        cached = _agent_graphs.get(project_id)
+        if cached:
+            return cached.graph
+
+    checkpointer, connection = await create_checkpointer()
+    try:
+        graph = await run_in_threadpool(build_project_graph, project_id, checkpointer)
+    except Exception:
+        await connection.close()
+        raise
+
+    runtime = AgentRuntime(graph=graph, checkpointer=checkpointer, connection=connection)
     with _agent_graph_lock:
         existing = _agent_graphs.get(project_id)
-        if existing:
-            conn.close()
-            return existing.graph
-        _agent_graphs[project_id] = runtime
+        if existing is None:
+            _agent_graphs[project_id] = runtime
+    if existing is not None:
+        # Another request built this project's graph first; discard the loser.
+        await connection.close()
+        return existing.graph
     return graph
 
 
-def run_agent(context: RunContext, prompt: str) -> str:
-    if not os.environ.get("PORTKEY_API_KEY"):
-        context_token = service_state.CURRENT_RUN_CONTEXT.set(context)
-        try:
-            return simulate_agent_response(context, prompt)
-        finally:
-            service_state.CURRENT_RUN_CONTEXT.reset(context_token)
+async def run_agent(context: RunContext, prompt: str) -> str:
+    """Run one prompt to completion without occupying a worker thread while waiting.
 
-    agent = get_agent_graph(context.project_id)
+    The run context is set on the current asyncio context. LangGraph copies that
+    context into the executor it uses for synchronous tools, so ``execute_python``
+    and ``get_project_context`` still observe the active run.
+    """
     context_token = service_state.CURRENT_RUN_CONTEXT.set(context)
     try:
-        result = agent.invoke(
+        if not os.environ.get("PORTKEY_API_KEY"):
+            return await run_in_threadpool(simulate_agent_response, context, prompt)
+
+        agent = await get_agent_graph(context.project_id)
+        result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": prompt}]},
             config=agent_run_config(
                 context.user_id, context.project_id, context.session_id
@@ -553,8 +610,8 @@ def final_text_from_update(namespace: tuple[str, ...], data: Any) -> str:
     return ""
 
 
-def run_activity_event(context: RunContext, message: str) -> str:
-    update_task_run_activity(context.run_id, message)
+async def run_activity_event(context: RunContext, message: str) -> str:
+    await run_in_threadpool(update_task_run_activity, context.run_id, message)
     return sse_event(
         "status",
         {
@@ -566,12 +623,16 @@ def run_activity_event(context: RunContext, message: str) -> str:
     )
 
 
-def stream_agent_events(context: RunContext, prompt: str) -> Iterator[str]:
+async def stream_agent_events(context: RunContext, prompt: str) -> AsyncIterator[str]:
     started_at = time.monotonic()
     final_text = ""
     delta_parts: List[str] = []
     emitted_delta = False
     initial_status = "Preparing the agent workspace…"
+    # An async generator runs in its caller's context, and Starlette drives this
+    # one from a single request task, so the run context set here stays visible
+    # for the whole run, including inside synchronous agent tools.
+    context_token = service_state.CURRENT_RUN_CONTEXT.set(context)
     try:
         yield sse_event(
             "run",
@@ -583,39 +644,25 @@ def stream_agent_events(context: RunContext, prompt: str) -> Iterator[str]:
             },
         )
         if not os.environ.get("PORTKEY_API_KEY"):
-            yield run_activity_event(context, "Preparing a local response…")
-            context_token = service_state.CURRENT_RUN_CONTEXT.set(context)
-            try:
-                final_text = simulate_agent_response(context, prompt)
-            finally:
-                service_state.CURRENT_RUN_CONTEXT.reset(context_token)
+            yield await run_activity_event(context, "Preparing a local response…")
+            final_text = await run_in_threadpool(simulate_agent_response, context, prompt)
         else:
-            agent = get_agent_graph(context.project_id)
-            yield run_activity_event(context, initial_status)
-            agent_events = iter(
-                agent.stream(
-                    {"messages": [{"role": "user", "content": prompt}]},
-                    config=agent_run_config(
-                        context.user_id, context.project_id, context.session_id
-                    ),
-                    stream_mode=["updates", "messages", "tasks"],
-                    subgraphs=True,
-                )
-            )
-            while True:
-                context_token = service_state.CURRENT_RUN_CONTEXT.set(context)
-                try:
-                    chunk = next(agent_events)
-                except StopIteration:
-                    break
-                finally:
-                    service_state.CURRENT_RUN_CONTEXT.reset(context_token)
+            agent = await get_agent_graph(context.project_id)
+            yield await run_activity_event(context, initial_status)
+            async for chunk in agent.astream(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config=agent_run_config(
+                    context.user_id, context.project_id, context.session_id
+                ),
+                stream_mode=["updates", "messages", "tasks"],
+                subgraphs=True,
+            ):
                 namespace, mode, data = chunk_parts(chunk)
 
                 if mode == "tasks":
                     status = task_status_from_event(namespace, data)
                     if status:
-                        yield run_activity_event(context, status)
+                        yield await run_activity_event(context, status)
                     continue
 
                 if mode == "messages":
@@ -639,13 +686,18 @@ def stream_agent_events(context: RunContext, prompt: str) -> Iterator[str]:
         if not final_text:
             final_text = "The model returned an empty response for this request. Please try again or rephrase your prompt."
 
-        yield run_activity_event(context, "Preparing generated files…")
-        artifacts = register_run_artifacts(context)
-        yield run_activity_event(context, "Finalizing the response…")
-        response_text = prepare_response_artifacts(
-            context.user_id, context.project_id, final_text, artifacts
+        yield await run_activity_event(context, "Preparing generated files…")
+        artifacts = await run_in_threadpool(register_run_artifacts, context)
+        yield await run_activity_event(context, "Finalizing the response…")
+        response_text = await run_in_threadpool(
+            prepare_response_artifacts,
+            context.user_id,
+            context.project_id,
+            final_text,
+            artifacts,
         )
-        add_chat_message(
+        await run_in_threadpool(
+            add_chat_message,
             context.user_id,
             context.project_id,
             context.session_id,
@@ -666,7 +718,9 @@ def stream_agent_events(context: RunContext, prompt: str) -> Iterator[str]:
                 "duration_seconds": round(time.monotonic() - started_at, 3),
             },
         )
-    except GeneratorExit:
+    except (asyncio.CancelledError, GeneratorExit):
+        # Terminal bookkeeping stays synchronous on this path: awaiting while the
+        # task is being cancelled re-raises immediately and would skip the update.
         finish_task_run(context.run_id, "cancelled")
         raise
     except Exception as exc:
@@ -683,6 +737,7 @@ def stream_agent_events(context: RunContext, prompt: str) -> Iterator[str]:
         )
         yield sse_event("error", {"message": error_text})
     finally:
+        service_state.CURRENT_RUN_CONTEXT.reset(context_token)
         cleanup_run_work(context)
 
 

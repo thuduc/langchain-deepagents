@@ -14,6 +14,69 @@ test("development login opens the project workspace", async ({ page }) => {
   await expect(page).toHaveURL(/\/projects\/nmdb-analytics\/new$/);
 });
 
+test("the workspace loads with no Content Security Policy violations", async ({ page }) => {
+  // A build that inlines a font as a data: URI is blocked by `font-src 'self'`
+  // and fails silently, so assert the console stays clean rather than trusting
+  // that assets were emitted as files.
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => pageErrors.push(String(error)));
+
+  await page.goto("/");
+  await page.getByPlaceholder("e.g. aludan").fill("playwright-csp-user");
+  await page.getByRole("button", { name: "Continue to workspace" }).click();
+  await expect(page.getByRole("button", { name: "HPI Analytics", exact: true })).toBeVisible();
+  await page.evaluate(() => document.fonts.ready);
+
+  const violations = consoleErrors.filter((text) => /Content Security Policy/i.test(text));
+  expect(violations, `CSP violations: ${violations.join(" | ")}`).toEqual([]);
+  expect(consoleErrors, `console errors: ${consoleErrors.join(" | ")}`).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
+test("submitting a prompt cannot open a second chat while the first is being created", async ({ page }) => {
+  await page.goto("/");
+  await page.getByPlaceholder("e.g. aludan").fill("playwright-double-submit-user");
+  await page.getByRole("button", { name: "Continue to workspace" }).click();
+  await page.getByRole("button", { name: "HPI Analytics", exact: true }).click();
+
+  // Keep the run off the model, and widen the chat-creation window that the
+  // composer previously stayed live through.
+  await page.route("**/api/chat/stream", (route) => route.abort());
+  const creations: string[] = [];
+  await page.route("**/api/projects/*/sessions", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    creations.push(route.request().url());
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    return route.fallback();
+  });
+
+  const composer = page.locator(".composer textarea");
+  await composer.fill("first prompt");
+  await composer.press("Enter");
+
+  // Read the state directly: an auto-retrying matcher would wait out the very
+  // window this test exists to check, and pass even when the guard is missing.
+  const lockedImmediately = await page.evaluate(() => {
+    const field = document.querySelector<HTMLTextAreaElement>(".composer textarea");
+    return field?.disabled === true;
+  });
+  expect(lockedImmediately, "composer stayed live while the chat was being created").toBe(true);
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(100);
+  }
+  await page.waitForTimeout(2500);
+
+  expect(creations).toHaveLength(1);
+  const sessions = await page.context().request.get("/api/projects/hpi-analytics/sessions");
+  expect((await sessions.json()).sessions).toHaveLength(1);
+});
+
 test("mobile project navigation opens and closes", async ({ page }) => {
   await page.setViewportSize({ width: 700, height: 900 });
   await page.goto("/");
@@ -124,8 +187,10 @@ test("project administrators can safely edit project contents", async ({ page })
   await page.getByPlaceholder("e.g. aludan").fill("playwright-project-editor");
   await page.getByRole("button", { name: "Continue to workspace" }).click();
 
-  page.once("dialog", (dialog) => dialog.accept(projectName));
-  await page.getByRole("button", { name: "Import new project" }).click();
+  await page.getByRole("button", { name: "New project" }).click();
+  const newProjectDialog = page.getByRole("dialog", { name: "New Project" });
+  await newProjectDialog.getByRole("textbox", { name: "Project name" }).fill(projectName);
+  await newProjectDialog.getByRole("button", { name: "Create project" }).click();
   await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/new$`));
 
   try {

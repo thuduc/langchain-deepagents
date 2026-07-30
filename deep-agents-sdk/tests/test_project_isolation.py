@@ -1,8 +1,10 @@
+import asyncio
 import io
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -10,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import jwt
+from fastapi import HTTPException
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +21,11 @@ if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
 from deep_agents_app import application  # noqa: E402
+from deep_agents_app.runtime import engine  # noqa: E402
+from deep_agents_app.services import artifacts as artifacts_service  # noqa: E402
+from deep_agents_app.services import project_files  # noqa: E402
+from deep_agents_app.services import sessions as sessions_service  # noqa: E402
+from deep_agents_app.services import uploads as uploads_service  # noqa: E402
 from deep_agents_app.services import workspace as server  # noqa: E402
 
 
@@ -50,7 +58,7 @@ class MultiUserIsolationTests(unittest.TestCase):
         self._create_project("hpi-analytics", "hpi-analysis")
         self._create_project("nmdb-analytics", "nmdb-analytics")
 
-        server.invalidate_all_agents()
+        engine.invalidate_all_agents()
         server._SKILLS_VALIDATED = False
         server.init_db()
         from fastapi.testclient import TestClient
@@ -63,7 +71,7 @@ class MultiUserIsolationTests(unittest.TestCase):
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
-        server.invalidate_all_agents()
+        engine.invalidate_all_agents()
         for name, value in self.originals.items():
             setattr(server, name, value)
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
@@ -372,7 +380,7 @@ class MultiUserIsolationTests(unittest.TestCase):
         )
         self.assertEqual(denied.status_code, 403)
 
-        with patch.object(server, "invalidate_project_agent") as invalidate:
+        with patch.object(project_files, "invalidate_project_agent") as invalidate:
             created_folder = self.client.post(
                 "/api/projects/hpi-analytics/folders",
                 headers=self.admin_headers,
@@ -510,8 +518,8 @@ class MultiUserIsolationTests(unittest.TestCase):
 
     def test_project_content_mutations_are_blocked_during_active_runs(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Active edit guard")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Active edit guard")
+        run = sessions_service.create_task_run(
             user_id,
             "hpi-analytics",
             session["id"],
@@ -527,8 +535,8 @@ class MultiUserIsolationTests(unittest.TestCase):
             self.assertIn("while tasks are running", response.json()["detail"])
             self.assertFalse(server.get_project_root("hpi-analytics").joinpath("data/blocked").exists())
         finally:
-            server.finish_task_run(run["id"], "completed")
-            server.cleanup_run_work(run["context"])
+            sessions_service.finish_task_run(run["id"], "completed")
+            sessions_service.cleanup_run_work(run["context"])
 
     def test_only_project_admin_can_mutate_projects_and_settings(self):
         denied = self.client.post(
@@ -627,11 +635,11 @@ class MultiUserIsolationTests(unittest.TestCase):
 
     def test_active_run_status_is_available_after_navigation(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Still working")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Still working")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "long-running request"
         )
-        server.update_task_run_activity(run["id"], "Working with project data…")
+        sessions_service.update_task_run_activity(run["id"], "Working with project data…")
 
         sessions = self.client.get(
             "/api/projects/hpi-analytics/sessions", headers=self.user1_headers
@@ -656,16 +664,16 @@ class MultiUserIsolationTests(unittest.TestCase):
             404,
         )
 
-        server.finish_task_run(run["id"], "completed")
-        server.cleanup_run_work(run["context"])
+        sessions_service.finish_task_run(run["id"], "completed")
+        sessions_service.cleanup_run_work(run["context"])
 
     def test_agent_events_have_user_facing_activity_statuses(self):
         self.assertEqual(
-            server.task_status_from_event((), {"name": "model", "input": {}}),
+            engine.task_status_from_event((), {"name": "model", "input": {}}),
             "Analyzing the request…",
         )
         self.assertEqual(
-            server.task_status_from_event(
+            engine.task_status_from_event(
                 ("tools:abc",), {"name": "tools", "input": {}}
             ),
             "A project specialist is working with the data…",
@@ -673,14 +681,14 @@ class MultiUserIsolationTests(unittest.TestCase):
 
     def test_startup_recovery_fails_interrupted_runs_and_cleans_work(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Interrupted")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Interrupted")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "unfinished work"
         )
         work_file = run["context"].work_directory / "partial.py"
         work_file.write_text("print('partial')\n", encoding="utf-8")
 
-        server.recover_interrupted_runs()
+        sessions_service.recover_interrupted_runs()
 
         with server.get_db_connection() as conn:
             row = conn.execute(
@@ -696,21 +704,21 @@ class MultiUserIsolationTests(unittest.TestCase):
         user2_id = self._user_id(self.user2_headers)
         for user_id in (user1_id, user2_id):
             for index in range(3):
-                server.create_session(user_id, "hpi-analytics", f"Session {index}")
-        server.prune_project_sessions(user1_id, "hpi-analytics", 2)
-        self.assertEqual(len(server.list_project_sessions(user1_id, "hpi-analytics", False)), 2)
-        self.assertEqual(len(server.list_project_sessions(user2_id, "hpi-analytics", False)), 3)
+                sessions_service.create_session(user_id, "hpi-analytics", f"Session {index}")
+        sessions_service.prune_project_sessions(user1_id, "hpi-analytics", 2)
+        self.assertEqual(len(sessions_service.list_project_sessions(user1_id, "hpi-analytics")), 2)
+        self.assertEqual(len(sessions_service.list_project_sessions(user2_id, "hpi-analytics")), 3)
 
     def test_checkpoint_thread_ids_include_user_project_and_session(self):
-        first = server.session_thread_id("user-a", "hpi-analytics", "same")
-        second = server.session_thread_id("user-b", "hpi-analytics", "same")
+        first = sessions_service.session_thread_id("user-a", "hpi-analytics", "same")
+        second = sessions_service.session_thread_id("user-b", "hpi-analytics", "same")
         self.assertEqual(first, "user:user-a:project:hpi-analytics:session:same")
         self.assertNotEqual(first, second)
 
     def test_artifacts_are_private_and_deleted_with_session(self):
         user1_id = self._user_id(self.user1_headers)
-        session = server.create_session(user1_id, "hpi-analytics", "Artifacts")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user1_id, "hpi-analytics", "Artifacts")
+        run = sessions_service.create_task_run(
             user1_id, "hpi-analytics", session["id"], "create chart"
         )
         context = run["context"]
@@ -718,8 +726,8 @@ class MultiUserIsolationTests(unittest.TestCase):
         work_path.write_text("print('temporary')\n", encoding="utf-8")
         artifact_path = context.artifact_directory / "chart.png"
         artifact_path.write_bytes(b"not-a-real-png")
-        artifact = server.register_run_artifacts(context)[0]
-        server.add_chat_message(
+        artifact = artifacts_service.register_run_artifacts(context)[0]
+        sessions_service.add_chat_message(
             user1_id,
             "hpi-analytics",
             session["id"],
@@ -727,7 +735,7 @@ class MultiUserIsolationTests(unittest.TestCase):
             "Generated a chart.",
             run["id"],
         )
-        server.finish_task_run(run["id"], "completed")
+        sessions_service.finish_task_run(run["id"], "completed")
 
         own = self.client.get(
             f"/api/artifacts/{artifact['id']}", headers=self.user1_headers
@@ -764,8 +772,8 @@ class MultiUserIsolationTests(unittest.TestCase):
 
     def test_python_outputs_are_private_session_artifacts(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "nmdb-analytics", "Private output")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "nmdb-analytics", "Private output")
+        run = sessions_service.create_task_run(
             user_id, "nmdb-analytics", session["id"], "create private output"
         )
         context = run["context"]
@@ -786,7 +794,7 @@ print(output)
 """
         token = server.CURRENT_RUN_CONTEXT.set(context)
         try:
-            result = server.execute_python_code(
+            result = engine.execute_python_code(
                 code, server.get_project_root("nmdb-analytics")
             )
         finally:
@@ -796,7 +804,7 @@ print(output)
         self.assertFalse(
             (server.get_project_root("nmdb-analytics") / "outputs").exists()
         )
-        artifacts = server.register_run_artifacts(context)
+        artifacts = artifacts_service.register_run_artifacts(context)
         artifact_names = {item["display_name"] for item in artifacts}
         self.assertEqual(artifact_names, {"direct.txt", "result.json"})
         self.assertTrue((context.artifact_directory / "outputs" / "result.json").is_file())
@@ -815,8 +823,8 @@ print(output)
 
     def test_absolute_project_outputs_are_recovered_as_private_artifacts(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Recovered output")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Recovered output")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "create output"
         )
         context = run["context"]
@@ -830,7 +838,7 @@ output.write_text("chart", encoding="utf-8")
 """
         token = server.CURRENT_RUN_CONTEXT.set(context)
         try:
-            server.execute_python_code(code, server.get_project_root("hpi-analytics"))
+            engine.execute_python_code(code, server.get_project_root("hpi-analytics"))
         finally:
             server.CURRENT_RUN_CONTEXT.reset(token)
 
@@ -843,13 +851,13 @@ output.write_text("chart", encoding="utf-8")
             / "chart.txt"
         )
         self.assertEqual(recovered.read_text(encoding="utf-8"), "chart")
-        artifacts = server.register_run_artifacts(context)
+        artifacts = artifacts_service.register_run_artifacts(context)
         self.assertEqual([item["display_name"] for item in artifacts], ["chart.txt"])
 
     def test_internal_download_paths_are_removed_from_new_and_stored_responses(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "nmdb-analytics", "Artifacts")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "nmdb-analytics", "Artifacts")
+        run = sessions_service.create_task_run(
             user_id, "nmdb-analytics", session["id"], "create export"
         )
         context = run["context"]
@@ -857,7 +865,7 @@ output.write_text("chart", encoding="utf-8")
         image_path = context.artifact_directory / "heatmap.png"
         csv_path.write_text("quarter,value\n2020Q1,1\n", encoding="utf-8")
         image_path.write_bytes(b"not-a-real-png")
-        artifacts = server.register_run_artifacts(context)
+        artifacts = artifacts_service.register_run_artifacts(context)
         raw_response = (
             "The heatmap analysis is complete.\n\n"
             "**Heatmap:**\n\n"
@@ -866,7 +874,7 @@ output.write_text("chart", encoding="utf-8")
             f"`{csv_path}`"
         )
 
-        prepared = server.prepare_response_artifacts(
+        prepared = artifacts_service.prepare_response_artifacts(
             user_id, "nmdb-analytics", raw_response, artifacts
         )
         self.assertNotIn(str(csv_path), prepared)
@@ -878,8 +886,8 @@ output.write_text("chart", encoding="utf-8")
         self.assertIn("![heatmap.png](/api/artifacts/", prepared)
         self.assertEqual(prepared.count("/api/artifacts/"), 2)
 
-        legacy_response = server.append_artifact_links(raw_response, artifacts)
-        server.add_chat_message(
+        legacy_response = artifacts_service.append_artifact_links(raw_response, artifacts)
+        sessions_service.add_chat_message(
             user_id,
             "nmdb-analytics",
             session["id"],
@@ -887,7 +895,7 @@ output.write_text("chart", encoding="utf-8")
             legacy_response,
             run["id"],
         )
-        server.finish_task_run(run["id"], "completed")
+        sessions_service.finish_task_run(run["id"], "completed")
         loaded = self.client.get(
             f"/api/projects/nmdb-analytics/sessions/{session['id']}",
             headers=self.user1_headers,
@@ -902,16 +910,16 @@ output.write_text("chart", encoding="utf-8")
 
     def test_relative_workspace_artifact_paths_are_removed_from_responses(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "nmdb-analytics", "Relative artifact")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "nmdb-analytics", "Relative artifact")
+        run = sessions_service.create_task_run(
             user_id, "nmdb-analytics", session["id"], "create relative export"
         )
         context = run["context"]
         relative_output = context.work_directory / "outputs" / "result.csv"
         relative_output.parent.mkdir(parents=True)
         relative_output.write_text("value\n42\n", encoding="utf-8")
-        artifacts = server.register_run_artifacts(context)
-        prepared = server.prepare_response_artifacts(
+        artifacts = artifacts_service.register_run_artifacts(context)
+        prepared = artifacts_service.prepare_response_artifacts(
             user_id,
             "nmdb-analytics",
             "Analysis complete.\n\nFiltered data CSV: `outputs/result.csv`",
@@ -923,14 +931,14 @@ output.write_text("chart", encoding="utf-8")
 
     def test_empty_artifact_placeholder_sections_are_removed(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Chart cleanup")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Chart cleanup")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "create chart"
         )
         context = run["context"]
         chart_path = context.artifact_directory / "indexed_growth.png"
         chart_path.write_bytes(b"not-a-real-png")
-        artifacts = server.register_run_artifacts(context)
+        artifacts = artifacts_service.register_run_artifacts(context)
         raw_response = (
             "## Findings\n\nMountain outpaced the national index.\n\n"
             "---\n\n## Visualization\n\n"
@@ -941,7 +949,7 @@ output.write_text("chart", encoding="utf-8")
             "## Key takeaways\n\nRegional performance diverged."
         )
 
-        prepared = server.prepare_response_artifacts(
+        prepared = artifacts_service.prepare_response_artifacts(
             user_id, "hpi-analytics", raw_response, artifacts
         )
         self.assertNotIn(str(chart_path), prepared)
@@ -955,7 +963,7 @@ output.write_text("chart", encoding="utf-8")
         # Session history normalizes already-prepared responses again, so the
         # cleanup and generated artifact section must remain stable.
         self.assertEqual(
-            server.prepare_response_artifacts(
+            artifacts_service.prepare_response_artifacts(
                 user_id, "hpi-analytics", prepared, artifacts
             ),
             prepared,
@@ -963,8 +971,8 @@ output.write_text("chart", encoding="utf-8")
 
     def test_superseded_chart_attempts_are_not_presented(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Chart selection")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Chart selection")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "create one chart"
         )
         context = run["context"]
@@ -972,7 +980,7 @@ output.write_text("chart", encoding="utf-8")
         final_chart = context.artifact_directory / "monthly_trends_normalized.png"
         first_chart.write_bytes(b"first-chart")
         final_chart.write_bytes(b"final-chart")
-        artifacts = server.register_run_artifacts(context)
+        artifacts = artifacts_service.register_run_artifacts(context)
         raw_response = (
             "## Visualization\n\nThe indexed growth-path chart was generated here:\n\n"
             "```text\n"
@@ -980,7 +988,7 @@ output.write_text("chart", encoding="utf-8")
             "```"
         )
 
-        prepared = server.prepare_response_artifacts(
+        prepared = artifacts_service.prepare_response_artifacts(
             user_id, "hpi-analytics", raw_response, artifacts
         )
         self.assertNotIn("monthly_trends.png]", prepared)
@@ -990,18 +998,18 @@ output.write_text("chart", encoding="utf-8")
         # A legacy stored response may already contain links for both attempts
         # while its visualization placeholder is empty. Prefer the final image
         # and persist that selection on subsequent history normalization.
-        legacy = server.append_artifact_links(
+        legacy = artifacts_service.append_artifact_links(
             "## Visualization\n\nThe chart was generated here:\n\n```text\n```",
             artifacts,
         )
-        migrated = server.prepare_response_artifacts(
+        migrated = artifacts_service.prepare_response_artifacts(
             user_id, "hpi-analytics", legacy, artifacts
         )
         self.assertNotIn("monthly_trends.png]", migrated)
         self.assertIn("monthly_trends_normalized.png]", migrated)
         self.assertEqual(migrated.count("/api/artifacts/"), 1)
         self.assertEqual(
-            server.prepare_response_artifacts(
+            artifacts_service.prepare_response_artifacts(
                 user_id, "hpi-analytics", migrated, artifacts
             ),
             migrated,
@@ -1009,15 +1017,15 @@ output.write_text("chart", encoding="utf-8")
 
     def test_distinct_unreferenced_images_are_all_presented(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Two charts")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Two charts")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "create two charts"
         )
         context = run["context"]
         (context.artifact_directory / "growth.png").write_bytes(b"growth")
         (context.artifact_directory / "seasonality.png").write_bytes(b"seasonality")
-        artifacts = server.register_run_artifacts(context)
-        prepared = server.prepare_response_artifacts(
+        artifacts = artifacts_service.register_run_artifacts(context)
+        prepared = artifacts_service.prepare_response_artifacts(
             user_id,
             "hpi-analytics",
             "## Findings\n\nThe growth and seasonality views show different patterns.",
@@ -1029,15 +1037,15 @@ output.write_text("chart", encoding="utf-8")
 
     def test_meaningful_visualization_analysis_is_preserved(self):
         user_id = self._user_id(self.user1_headers)
-        session = server.create_session(user_id, "hpi-analytics", "Chart narrative")
-        run = server.create_task_run(
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Chart narrative")
+        run = sessions_service.create_task_run(
             user_id, "hpi-analytics", session["id"], "analyze chart"
         )
         context = run["context"]
         chart_path = context.artifact_directory / "trend.png"
         chart_path.write_bytes(b"not-a-real-png")
-        artifacts = server.register_run_artifacts(context)
-        prepared = server.prepare_response_artifacts(
+        artifacts = artifacts_service.register_run_artifacts(context)
+        prepared = artifacts_service.prepare_response_artifacts(
             user_id,
             "hpi-analytics",
             (
@@ -1070,9 +1078,9 @@ output.write_text("chart", encoding="utf-8")
         self.assertEqual(preview.status_code, 200)
         token = preview.json()["upload_token"]
         admin_id = self._user_id(self.admin_headers)
-        self.assertTrue(server.upload_path_for_token(admin_id, token).exists())
+        self.assertTrue(uploads_service.upload_path_for_token(admin_id, token).exists())
         with self.assertRaises(Exception):
-            server.upload_path_for_token(self._user_id(self.user1_headers), token)
+            uploads_service.upload_path_for_token(self._user_id(self.user1_headers), token)
 
     def test_admin_import_is_transactional_and_preview_is_single_use(self):
         payload = io.BytesIO()
@@ -1116,7 +1124,7 @@ output.write_text("chart", encoding="utf-8")
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr("../outside.txt", "bad")
         with self.assertRaises(Exception):
-            server.inspect_zip(payload)
+            uploads_service.inspect_zip(payload)
 
     def test_isolation_audit_is_admin_only_and_passes(self):
         denied = self.client.get(
@@ -1167,6 +1175,298 @@ output.write_text("chart", encoding="utf-8")
         ):
             with self.assertRaises(RuntimeError):
                 server.load_runtime_paths(base, projects, static)
+
+    def _set_retention_cap(self, limit):
+        """Lower the cap without going through the pruning write path."""
+        with server.get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("max_sessions_per_project", str(limit), server.utc_now()),
+            )
+
+    def test_listing_sessions_never_deletes_them(self):
+        user_id = self._user_id(self.user1_headers)
+        for index in range(3):
+            session = sessions_service.create_session(
+                user_id, "hpi-analytics", f"Session {index}"
+            )
+            artifact_dir = (
+                server.ARTIFACTS_DIR / user_id / "hpi-analytics" / session["id"] / "run"
+            )
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "analysis.png").write_bytes(b"chart")
+
+        self._set_retention_cap(1)
+
+        listed = self.client.get(
+            "/api/projects/hpi-analytics/sessions", headers=self.user1_headers
+        )
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.json()["sessions"]), 3)
+        self.assertEqual(
+            len(list((server.ARTIFACTS_DIR / user_id / "hpi-analytics").iterdir())), 3
+        )
+
+        # The cap still applies, but only on a write path.
+        sessions_service.create_session(user_id, "hpi-analytics", "Session 3")
+        self.assertEqual(
+            len(sessions_service.list_project_sessions(user_id, "hpi-analytics")), 1
+        )
+
+    def test_visualization_narration_is_not_removed_as_a_placeholder(self):
+        user_id = self._user_id(self.user1_headers)
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Narrative")
+        run = sessions_service.create_task_run(
+            user_id, "hpi-analytics", session["id"], "analyze"
+        )
+        chart_path = run["context"].artifact_directory / "trend.png"
+        chart_path.write_bytes(b"not-a-real-png")
+        artifacts = artifacts_service.register_run_artifacts(run["context"])
+
+        prepared = artifacts_service.prepare_response_artifacts(
+            user_id,
+            "hpi-analytics",
+            (
+                "## Chart interpretation\n\n"
+                "The generated plot shows seasonality below.\n\n"
+                "Prices were saved from a steeper decline by rate cuts.\n"
+            ),
+            artifacts,
+        )
+        self.assertIn("## Chart interpretation", prepared)
+        self.assertIn("The generated plot shows seasonality below.", prepared)
+        self.assertIn("saved from a steeper decline", prepared)
+
+    def test_directories_with_colliding_slugs_each_stay_reachable(self):
+        for name in ("Housing Data", "housing-data"):
+            (server.PROJECTS_ROOT / name / "data").mkdir(parents=True)
+            (server.PROJECTS_ROOT / name / "skills").mkdir(parents=True)
+        server.init_db()
+
+        listed = self.client.get("/api/projects", headers=self.user1_headers).json()
+        by_path = {}
+        with server.get_db_connection() as conn:
+            for row in conn.execute("SELECT id, relative_path FROM projects").fetchall():
+                by_path[row["relative_path"]] = row["id"]
+        self.assertEqual(by_path["Housing Data"], "housing-data")
+        self.assertEqual(by_path["housing-data"], "housing-data-2")
+        self.assertNotEqual(by_path["Housing Data"], by_path["housing-data"])
+
+        identifiers = {item["id"] for item in listed["projects"]}
+        self.assertIn("housing-data", identifiers)
+        self.assertIn("housing-data-2", identifiers)
+
+        # Registration is idempotent: a second scan adds nothing.
+        server.init_db()
+        with server.get_db_connection() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) AS count FROM projects").fetchone()["count"],
+                len(identifiers),
+            )
+
+    def test_stale_staged_uploads_and_exports_are_reclaimed(self):
+        admin_id = self._user_id(self.admin_headers)
+        fresh_paths = []
+        stale_paths = []
+        for staging_name in uploads_service.STAGING_SUBDIRECTORIES:
+            staging_dir = server.TMP_UPLOADS_DIR / admin_id / staging_name
+            staging_dir.mkdir(parents=True)
+            fresh = staging_dir / "fresh.bin"
+            fresh.write_bytes(b"in flight")
+            fresh_paths.append(fresh)
+            stale = staging_dir / "orphaned.bin"
+            stale.write_bytes(b"abandoned")
+            aged = time.time() - uploads_service.STAGING_MAX_AGE_SECONDS - 60
+            os.utime(stale, (aged, aged))
+            stale_paths.append(stale)
+
+        uploads_service.prune_stale_upload_staging()
+
+        for path in stale_paths:
+            self.assertFalse(path.exists(), f"{path} should have been reclaimed")
+        for path in fresh_paths:
+            self.assertTrue(path.exists(), f"{path} was still in flight")
+
+    def test_file_names_survive_prose_but_private_paths_do_not(self):
+        """A file name reveals nothing the download card does not already show.
+
+        Deleting one from mid-sentence only wrecks the prose, so names stay and
+        the private run layout still goes.
+        """
+        user_id = self._user_id(self.user1_headers)
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Naming")
+        run = sessions_service.create_task_run(
+            user_id, "hpi-analytics", session["id"], "make a module"
+        )
+        context = run["context"]
+        (context.artifact_directory / "hpi_tools.py").write_text("x = 1\n", encoding="utf-8")
+        nested = context.work_directory / "outputs" / "result.csv"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("value\n42\n", encoding="utf-8")
+        artifacts = artifacts_service.register_run_artifacts(context)
+
+        prepared = artifacts_service.prepare_response_artifacts(
+            user_id,
+            "hpi-analytics",
+            (
+                "The load_hpi() function in `hpi_tools.py` loads the index.\n\n"
+                "- **hpi_tools.py** — reusable helpers for loading the index.\n\n"
+                "Filtered data CSV: `outputs/result.csv`\n\n"
+                "hpi_tools.py\n"
+            ),
+            artifacts,
+        )
+        body = artifacts_service.GENERATED_ARTIFACTS_HEADING_RE.split(prepared, maxsplit=1)[0]
+
+        # Kept: the name inside a sentence, with its wrapper intact.
+        self.assertIn("The load_hpi() function in `hpi_tools.py` loads the index.", body)
+        self.assertIn("**hpi_tools.py** — reusable helpers for loading the index.", body)
+        # Removed: the private run layout, taking its wrapper with it rather
+        # than stranding an empty `` or **** where the path used to be.
+        self.assertNotIn("outputs/result.csv", body)
+        self.assertNotIn("``", body)
+        self.assertNotIn("****", body)
+        self.assertNotIn(str(context.work_directory), body)
+        # A line that is only a file name is still dropped as a bare label.
+        self.assertEqual(
+            [line for line in body.splitlines() if line.strip() == "hpi_tools.py"], []
+        )
+        self.assertIn("[hpi_tools.py](/api/artifacts/", prepared)
+
+    def test_run_rejections_report_the_specific_reason(self):
+        user_id = self._user_id(self.user1_headers)
+        sessions = [
+            sessions_service.create_session(user_id, "hpi-analytics", f"Busy {index}")
+            for index in range(4)
+        ]
+        with patch.dict(os.environ, {"MAX_CONCURRENT_RUNS_PER_USER": "3"}):
+            for index in range(3):
+                sessions_service.create_task_run(
+                    user_id, "hpi-analytics", sessions[index]["id"], "occupying a slot"
+                )
+
+            # A free chat while the account is at its limit: the limit is the reason.
+            with self.assertRaises(HTTPException) as at_limit:
+                sessions_service.create_task_run(
+                    user_id, "hpi-analytics", sessions[3]["id"], "one more"
+                )
+            self.assertEqual(at_limit.exception.status_code, 429)
+
+            # A busy chat is the more specific diagnosis and must win, even when
+            # the account-wide limit is also reached.
+            with self.assertRaises(HTTPException) as busy_chat:
+                sessions_service.create_task_run(
+                    user_id, "hpi-analytics", sessions[0]["id"], "same chat again"
+                )
+            self.assertEqual(busy_chat.exception.status_code, 409)
+            self.assertIn("already has a task running", busy_chat.exception.detail)
+
+        # Below the limit, a busy chat still reports 409.
+        with patch.dict(os.environ, {"MAX_CONCURRENT_RUNS_PER_USER": "10"}):
+            with self.assertRaises(HTTPException) as below_limit:
+                sessions_service.create_task_run(
+                    user_id, "hpi-analytics", sessions[1]["id"], "same chat again"
+                )
+            self.assertEqual(below_limit.exception.status_code, 409)
+
+    def test_generated_python_runs_without_a_venv_beside_the_source(self):
+        """The container image builds its environment at /opt/venv, outside the
+        source tree, so the interpreter must come from the running process."""
+        user_id = self._user_id(self.user1_headers)
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Image layout")
+        run = sessions_service.create_task_run(
+            user_id, "hpi-analytics", session["id"], "run python"
+        )
+        image_sdk_dir = self.tmp_dir / "image" / "app" / "deep-agents-sdk"
+        image_sdk_dir.mkdir(parents=True)
+        self.assertFalse((image_sdk_dir / "venv").exists())
+
+        token = server.CURRENT_RUN_CONTEXT.set(run["context"])
+        try:
+            with patch.object(server, "SDK_DIR", image_sdk_dir):
+                self.assertEqual(engine.python_binary(), sys.executable)
+                output = engine.execute_python_code(
+                    "import pandas\nprint('ran in the image layout')",
+                    server.get_project_root("hpi-analytics"),
+                )
+        finally:
+            server.CURRENT_RUN_CONTEXT.reset(token)
+
+        self.assertIn("ran in the image layout", output)
+        self.assertNotIn("virtual environment python binary not found", output)
+        self.assertNotIn("Error executing code", output)
+
+    def test_spa_shell_serves_client_routes_without_masking_api_404s(self):
+        for path in ("/", "/projects/hpi-analytics/new", "/projects/x/sessions/y", "/settings"):
+            page = self.client.get(path)
+            self.assertEqual(page.status_code, 200, path)
+            self.assertIn("text/html", page.headers["content-type"])
+
+        # A mistyped API or asset path must stay a 404 rather than returning the
+        # shell, which a caller would otherwise read as a successful response.
+        for path in ("/api/does-not-exist", "/api/projects/hpi-analytics/nope", "/static/missing.js"):
+            missing = self.client.get(path, headers=self.user1_headers)
+            self.assertEqual(missing.status_code, 404, path)
+            self.assertNotIn("text/html", missing.headers.get("content-type", ""))
+
+        # Declared API routes still win over the catch-all.
+        self.assertEqual(
+            self.client.get("/api/projects", headers=self.user1_headers).status_code, 200
+        )
+        self.assertEqual(self.client.get("/api/projects").status_code, 401)
+
+    def test_run_context_reaches_synchronous_tools_from_async_code(self):
+        """The async agent path relies on contextvars crossing into worker threads."""
+        from langchain_core.tools import tool
+        from starlette.concurrency import run_in_threadpool
+
+        @tool
+        def read_active_run() -> str:
+            """Read the ambient run context the way execute_python does."""
+            active = server.CURRENT_RUN_CONTEXT.get()
+            return "none" if active is None else active.run_id
+
+        user_id = self._user_id(self.user1_headers)
+        session = sessions_service.create_session(user_id, "hpi-analytics", "Context")
+        run = sessions_service.create_task_run(
+            user_id, "hpi-analytics", session["id"], "context probe"
+        )
+        context = run["context"]
+
+        async def exercise():
+            token = server.CURRENT_RUN_CONTEXT.set(context)
+            try:
+                direct = await run_in_threadpool(lambda: server.CURRENT_RUN_CONTEXT.get())
+                through_tool = await read_active_run.arun({})
+                concurrent = await asyncio.gather(
+                    *(read_active_run.arun({}) for _ in range(4))
+                )
+                return direct, through_tool, concurrent
+            finally:
+                server.CURRENT_RUN_CONTEXT.reset(token)
+
+        direct, through_tool, concurrent = asyncio.run(exercise())
+        self.assertIs(direct, context)
+        self.assertEqual(through_tool, context.run_id)
+        self.assertEqual(set(concurrent), {context.run_id})
+        self.assertIsNone(server.CURRENT_RUN_CONTEXT.get())
+
+    def test_skill_description_prefers_frontmatter_then_first_heading(self):
+        skills_dir = server.PROJECTS_ROOT / "hpi-analytics" / "skills"
+        (skills_dir / "headings-only").mkdir()
+        (skills_dir / "headings-only" / "SKILL.md").write_text(
+            "# First heading\n\nSome prose.\n\n# Later heading\n",
+            encoding="utf-8",
+        )
+        descriptions = {
+            skill["name"]: skill["description"]
+            for skill in server.scan_project_skills("hpi-analytics")
+        }
+        self.assertEqual(descriptions["headings-only"], "First heading")
+        self.assertEqual(descriptions["hpi-analysis"], "Test skill for hpi-analytics.")
 
 
 if __name__ == "__main__":

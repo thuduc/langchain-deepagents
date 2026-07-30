@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project } from "../types";
-import { ImportDialog, ProjectContentsDialog } from "./ProjectDialogs";
+import { ConfirmDialog, ImportDialog, ProjectContentsDialog, RenameProjectDialog } from "./ProjectDialogs";
 
 const { apiMock, downloadMock } = vi.hoisted(() => ({
   apiMock: vi.fn(),
@@ -206,5 +206,89 @@ describe("ImportDialog", () => {
     render(<ImportDialog open targetProject={project} newProject={false} onClose={vi.fn()} onComplete={vi.fn()} />);
     await waitFor(() => expect(apiMock).toHaveBeenCalledWith("/api/projects/hpi-analytics/content-summary"));
     expect(screen.queryByRole("checkbox", { name: /Replace all current project content/ })).not.toBeInTheDocument();
+  });
+
+  it("creates an empty project when no ZIP is chosen", async () => {
+    const onComplete = vi.fn().mockResolvedValue(undefined);
+    apiMock.mockReset();
+    apiMock.mockResolvedValue({ project });
+
+    render(<ImportDialog open newProject onClose={vi.fn()} onComplete={onComplete} />);
+    fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "Mortgage Analytics" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(project));
+    expect(apiMock).toHaveBeenCalledWith("/api/projects", expect.objectContaining({ method: "POST" }));
+    expect(JSON.parse(String(apiMock.mock.calls[0][1].body))).toEqual({ name: "Mortgage Analytics" });
+  });
+
+  it("reaches the project import endpoint when a ZIP is chosen", async () => {
+    const onComplete = vi.fn().mockResolvedValue(undefined);
+    apiMock.mockReset();
+    apiMock.mockImplementation((url: string) => {
+      if (url === "/api/uploads/preview") return Promise.resolve({
+        upload_token: "preview-token",
+        entries: [{ path: "data/new.csv", type: "file", size: 12 }],
+        entry_count: 1,
+        total_size: 12,
+      });
+      if (url === "/api/projects/import") return Promise.resolve({ project });
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    const { container } = render(<ImportDialog open newProject onClose={vi.fn()} onComplete={onComplete} />);
+    fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "Imported" } });
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(input!, { target: { files: [new File(["zip"], "project.zip", { type: "application/zip" })] } });
+    expect(await screen.findByText("1 entries, 12 B extracted")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(project));
+    const importCall = apiMock.mock.calls.find(([url]) => url === "/api/projects/import");
+    expect(JSON.parse(String(importCall?.[1]?.body))).toEqual({
+      name: "Imported",
+      upload_token: "preview-token",
+      mode: "merge",
+    });
+  });
+});
+
+describe("RenameProjectDialog", () => {
+  afterEach(cleanup);
+
+  it("saves a new name and reports failures inside the dialog", async () => {
+    const onRenamed = vi.fn().mockResolvedValue(undefined);
+    apiMock.mockReset();
+    apiMock.mockRejectedValueOnce(new Error("Project name cannot be empty"));
+
+    render(<RenameProjectDialog project={project} open onClose={vi.fn()} onRenamed={onRenamed} />);
+    fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Project name cannot be empty");
+    expect(onRenamed).not.toHaveBeenCalled();
+
+    apiMock.mockResolvedValueOnce({ project });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onRenamed).toHaveBeenCalled());
+    expect(JSON.parse(String(apiMock.mock.calls[1][1].body))).toEqual({ name: "Renamed" });
+  });
+});
+
+describe("ConfirmDialog", () => {
+  afterEach(cleanup);
+
+  it("confirms destructive actions and surfaces errors without a native dialog", async () => {
+    const onConfirm = vi.fn().mockRejectedValueOnce(new Error("A task is still running in this chat"));
+    const onClose = vi.fn();
+
+    render(<ConfirmDialog open title="Delete chat?" message="This cannot be undone." confirmLabel="Delete permanently" busyLabel="Deleting…" onConfirm={onConfirm} onClose={onClose} />);
+    expect(screen.getByRole("dialog", { name: "Delete chat?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("A task is still running in this chat");
+    expect(onClose).not.toHaveBeenCalled();
+
+    onConfirm.mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
 });

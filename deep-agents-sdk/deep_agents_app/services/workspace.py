@@ -1,3 +1,20 @@
+"""Shared application state: configuration, storage roots, identity, and the
+project registry.
+
+This is the lowest application layer. It must never import another
+``deep_agents_app.services`` or ``deep_agents_app.runtime`` module, because
+every one of those imports this one. Orchestration that needs both belongs in a
+router or in :mod:`deep_agents_app.services.project_admin`.
+
+The storage roots below (``DB_PATH``, ``WORK_DIR``, ``ARTIFACTS_DIR``,
+``TMP_UPLOADS_DIR``, ``PROJECTS_ROOT``, ``AGENT_CHECKPOINT_DB_PATH``) are
+rebound by tests to temporary directories. Other modules must therefore read
+them as attributes of this module (``state.ARTIFACTS_DIR``) and must never
+import them by value (``from ... import ARTIFACTS_DIR``), which would capture
+the production path and let a failing test write to real user data.
+``test_layering.py`` enforces this.
+"""
+
 import os
 import re
 import secrets
@@ -190,11 +207,14 @@ def get_db_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    """Create or migrate the schema and register on-disk projects.
+
+    This runs once from the application lifespan, not per request.
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_db_connection() as conn:
         initialize_schema(conn)
         register_project_directories(conn)
-    prune_expired_uploads()
     validate_all_project_skills_once()
 
 
@@ -203,23 +223,56 @@ def project_display_name(slug: str) -> str:
     return " ".join(acronyms.get(part, part.capitalize()) for part in slug.split("-"))
 
 
+def unique_project_slug(conn: sqlite3.Connection, base_slug: str) -> str:
+    slug = base_slug
+    counter = 2
+    while conn.execute(
+        "SELECT 1 FROM projects WHERE id = ? OR slug = ?", (slug, slug)
+    ).fetchone():
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+    return slug
+
+
 def register_project_directories(conn: sqlite3.Connection) -> None:
+    """Register every project directory on disk exactly once.
+
+    The directory's relative path is the stable key. Two directories whose
+    names reduce to the same slug (``Housing Data`` and ``housing-data``) each
+    keep their own project record; previously the second silently overwrote the
+    first and became unreachable through the API.
+    """
     projects_dir = get_projects_dir()
     now = utc_now()
+    registered = {
+        row["relative_path"]
+        for row in conn.execute("SELECT relative_path FROM projects").fetchall()
+    }
     for project_path in sorted(projects_dir.iterdir()):
         if not project_path.is_dir() or project_path.name.startswith("."):
             continue
-        slug = slugify(project_path.name)
+        if project_path.name in registered:
+            continue
+        base_slug = slugify(project_path.name)
+        slug = unique_project_slug(conn, base_slug)
+        if slug != base_slug:
+            logger.warning(
+                "Project directory %r reduces to the already-registered identifier %r; "
+                "registering it as %r instead",
+                project_path.name,
+                base_slug,
+                slug,
+            )
         conn.execute(
             """
             INSERT INTO projects (
                 id, name, slug, relative_path, status, content_revision,
                 created_by, created_at, updated_at
             ) VALUES (?, ?, ?, ?, 'active', 1, NULL, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET relative_path = excluded.relative_path
             """,
             (slug, project_display_name(slug), slug, project_path.name, now, now),
         )
+        registered.add(project_path.name)
 
 
 def upsert_current_user(identity: TokenIdentity) -> CurrentUser:
@@ -271,7 +324,6 @@ def get_current_user(
             raise AuthenticationError("Missing x-fnma-jws-token header")
     except AuthenticationError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
-    init_db()
     return upsert_current_user(identity)
 
 
@@ -361,7 +413,15 @@ def get_app_settings() -> Dict[str, Any]:
     }
 
 
-def save_app_settings(default_model: str, max_sessions_per_project: int) -> Dict[str, Any]:
+def save_app_settings(
+    default_model: str, max_sessions_per_project: int
+) -> tuple[Dict[str, Any], bool]:
+    """Persist global settings and report whether the default model changed.
+
+    Invalidating cached agent graphs and re-applying the retention cap are
+    side effects owned by the settings router, so that this module stays free
+    of dependencies on the runtime and session layers.
+    """
     available_models = parse_available_models()
     if default_model not in available_models:
         raise HTTPException(status_code=400, detail="Default model must be one of the available models")
@@ -382,77 +442,7 @@ def save_app_settings(default_model: str, max_sessions_per_project: int) -> Dict
             ],
         )
 
-    if default_model != old_settings["default_model"]:
-        invalidate_all_agents()
-
-    prune_all_project_sessions(max_sessions)
-    return get_app_settings()
-
-
-def prune_project_sessions(
-    user_id: str,
-    project_id: str,
-    max_sessions: Optional[int] = None,
-) -> None:
-    limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
-    limit = coerce_max_sessions(limit, DEFAULT_MAX_SESSIONS_PER_PROJECT)
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT cs.id, cs.thread_id FROM chat_sessions AS cs
-            WHERE cs.user_id = ? AND cs.project_id = ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM task_runs AS tr
-                  WHERE tr.session_id = cs.id AND tr.status = 'running'
-              )
-            ORDER BY cs.updated_at DESC, cs.created_at DESC, cs.id DESC
-            """,
-            (user_id, project_id),
-        ).fetchall()
-    for row in rows[limit:]:
-        delete_session_resources(user_id, project_id, row["id"], row["thread_id"])
-
-
-def prune_all_project_sessions(max_sessions: Optional[int] = None) -> None:
-    limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT user_id, project_id FROM chat_sessions"
-        ).fetchall()
-    for row in rows:
-        prune_project_sessions(row["user_id"], row["project_id"], limit)
-
-
-def list_project_sessions(
-    user_id: str,
-    project_id: str,
-    prune: bool = True,
-) -> List[Dict[str, Any]]:
-    if prune:
-        prune_project_sessions(user_id, project_id)
-    with get_db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT cs.*,
-                   (
-                       SELECT tr.id FROM task_runs AS tr
-                       WHERE tr.session_id = cs.id AND tr.user_id = cs.user_id
-                         AND tr.status = 'running'
-                       ORDER BY tr.created_at DESC LIMIT 1
-                   ) AS active_run_id,
-                   (
-                       SELECT tr.latest_status FROM task_runs AS tr
-                       WHERE tr.session_id = cs.id AND tr.user_id = cs.user_id
-                         AND tr.status = 'running'
-                       ORDER BY tr.created_at DESC LIMIT 1
-                   ) AS active_run_status
-            FROM chat_sessions AS cs
-            WHERE cs.user_id = ? AND cs.project_id = ?
-            ORDER BY cs.updated_at DESC, cs.created_at DESC, cs.id DESC
-            """,
-            (user_id, project_id),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    return get_app_settings(), default_model != old_settings["default_model"]
 
 
 def row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
@@ -569,78 +559,6 @@ def project_artifact_context(context: RunContext) -> Dict[str, str]:
     }
 
 
-def project_isolation_audit(user_id: str, project_id: str) -> Dict[str, Any]:
-    project = get_project(project_id)
-    project_root = Path(project["path"])
-    projects_dir = get_projects_dir()
-    skills_dir = get_skill_dir(project_id)
-    skills = scan_project_skills(project_id)
-    sample_session_id = "isolation-audit"
-    sample_run_id = "sample-run"
-    run_context = create_run_context(
-        user_id, project_id, sample_session_id, sample_run_id, create=False
-    )
-    artifact_context = project_artifact_context(run_context)
-    artifact_dir = run_context.artifact_directory.resolve()
-
-    checks = {
-        "project_root_within_projects_dir": project_root == projects_dir or projects_dir in project_root.parents,
-        "skills_dir_within_project_root": skills_dir == project_root or project_root in skills_dir.parents,
-        "skills_are_project_local": all(
-            (skills_dir / skill["name"] / "SKILL.md").resolve().is_file()
-            and project_root in (skills_dir / skill["name"] / "SKILL.md").resolve().parents
-            for skill in skills
-        ),
-        "checkpoint_threads_include_user_project_and_session": (
-            session_thread_id(user_id, project_id, sample_session_id)
-            == f"user:{user_id}:project:{project_id}:session:{sample_session_id}"
-        ),
-        "agent_checkpoints_separate_from_app_db": AGENT_CHECKPOINT_DB_PATH.resolve() != DB_PATH.resolve(),
-        "artifact_directory_user_project_session_run_scoped": (
-            artifact_dir
-            == (
-                ARTIFACTS_DIR
-                / user_id
-                / project_id
-                / sample_session_id
-                / sample_run_id
-            ).resolve()
-        ),
-        "work_directory_user_project_session_run_scoped": (
-            run_context.work_directory.resolve()
-            == (
-                WORK_DIR
-                / user_id
-                / project_id
-                / sample_session_id
-                / sample_run_id
-            ).resolve()
-        ),
-    }
-
-    return {
-        "project_id": project_id,
-        "project_name": project["name"],
-        "project_root": str(project_root),
-        "skills_dir": str(skills_dir),
-        "skills": skills,
-        "skills_source": project_skills_source(project),
-        "filesystem_backend": {
-            "root_dir": str(project_root),
-            "virtual_mode": True,
-        },
-        "filesystem_permissions": project_filesystem_permission_specs(),
-        "checkpointing": {
-            "app_db": str(DB_PATH),
-            "agent_checkpoint_db": str(AGENT_CHECKPOINT_DB_PATH),
-            "sample_thread_id": session_thread_id(user_id, project_id, sample_session_id),
-        },
-        "artifacts": artifact_context,
-        "checks": checks,
-        "passed": all(checks.values()),
-    }
-
-
 def touch_project(project_id: str, bump_revision: bool = False) -> None:
     with get_db_connection() as conn:
         if bump_revision:
@@ -692,11 +610,7 @@ def create_project_record(name: str, created_by: str) -> Dict[str, Any]:
     slug = base_slug
 
     with get_db_connection() as conn:
-        counter = 2
-        while conn.execute("SELECT 1 FROM projects WHERE id = ?", (slug,)).fetchone():
-            slug = f"{base_slug}-{counter}"
-            counter += 1
-
+        slug = unique_project_slug(conn, base_slug)
         project_path = ensure_child_path(projects_dir, projects_dir / slug)
         if project_path.exists():
             raise HTTPException(status_code=409, detail="Project folder already exists")
@@ -816,19 +730,26 @@ def scan_project_skills(project_id: str) -> List[Dict[str, str]]:
         if skill_path.is_symlink() or not skill_path.is_dir() or not skill_md.exists():
             continue
 
-        desc = f"Specialist skill for {skill_path.name}"
+        description = ""
+        first_heading = ""
         try:
-            lines = skill_md.read_text(encoding="utf-8").splitlines()[:30]
-            for line in lines:
+            for line in skill_md.read_text(encoding="utf-8").splitlines()[:30]:
                 if line.lower().startswith("description:"):
-                    desc = line.split(":", 1)[1].strip().strip("\"'")
+                    description = line.split(":", 1)[1].strip().strip("\"'")
                     break
-                if line.startswith("#"):
-                    desc = line.replace("#", "").strip()
+                if line.startswith("#") and not first_heading:
+                    first_heading = line.lstrip("#").strip()
         except Exception:
             pass
 
-        skills.append({"name": skill_path.name, "description": desc})
+        skills.append(
+            {
+                "name": skill_path.name,
+                "description": description
+                or first_heading
+                or f"Specialist skill for {skill_path.name}",
+            }
+        )
     return skills
 
 
@@ -888,82 +809,28 @@ def reset_project_contents_transactional(project_root: Path) -> None:
             shutil.rmtree(staging)
 
 
-def delete_project_resources(project_id: str, project_root: Path) -> None:
-    ensure_no_active_project_runs(project_id)
+def purge_project_artifact_directories(project_id: str) -> None:
+    """Remove every user's retained artifacts for a project being deleted."""
+    if not ARTIFACTS_DIR.exists():
+        return
+    for user_dir in ARTIFACTS_DIR.iterdir():
+        candidate = user_dir / project_id
+        try:
+            candidate = ensure_child_path(ARTIFACTS_DIR, candidate)
+        except HTTPException:
+            continue
+        if candidate.exists():
+            shutil.rmtree(candidate)
+
+
+def mark_project_status(project_id: str, status: str) -> None:
     with get_db_connection() as conn:
-        sessions = conn.execute(
-            "SELECT id, user_id, thread_id FROM chat_sessions WHERE project_id = ?",
-            (project_id,),
-        ).fetchall()
         conn.execute(
-            "UPDATE projects SET status = 'deleting', updated_at = ? WHERE id = ?",
-            (utc_now(), project_id),
+            "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
+            (status, utc_now(), project_id),
         )
 
-    invalidate_project_agent(project_id)
-    try:
-        for session in sessions:
-            delete_session_resources(
-                session["user_id"], project_id, session["id"], session["thread_id"]
-            )
-        for user_dir in ARTIFACTS_DIR.iterdir() if ARTIFACTS_DIR.exists() else []:
-            candidate = user_dir / project_id
-            try:
-                candidate = ensure_child_path(ARTIFACTS_DIR, candidate)
-            except HTTPException:
-                continue
-            if candidate.exists():
-                shutil.rmtree(candidate)
-        if project_root.exists():
-            shutil.rmtree(project_root)
-        with get_db_connection() as conn:
-            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    except Exception:
-        with get_db_connection() as conn:
-            conn.execute(
-                "UPDATE projects SET status = 'active', updated_at = ? WHERE id = ?",
-                (utc_now(), project_id),
-            )
-        raise
 
-from deep_agents_app.services.artifacts import (  # noqa: E402, F401
-    append_artifact_links,
-    prepare_response_artifacts,
-    register_run_artifacts,
-    unique_artifact_path,
-)
-
-
-from deep_agents_app.services.sessions import (  # noqa: E402, F401
-    add_chat_message,
-    cleanup_run_work,
-    create_session,
-    create_task_run,
-    delete_session_resources,
-    ensure_no_active_project_runs,
-    finish_task_run,
-    get_session,
-    maybe_title_session,
-    recover_interrupted_runs,
-    session_thread_id,
-    update_task_run_activity,
-)
-
-
-from deep_agents_app.runtime.engine import (  # noqa: E402, F401
-    execute_python_code,
-    invalidate_project_agent,
-    invalidate_all_agents,
-    run_agent,
-    task_status_from_event,
-    stream_agent_events,
-)
-
-from deep_agents_app.services.uploads import (  # noqa: E402, F401
-    cleanup_upload_preview,
-    extract_zip,
-    inspect_zip,
-    prune_expired_uploads,
-    record_upload_preview,
-    upload_path_for_token,
-)
+def delete_project_row(project_id: str) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))

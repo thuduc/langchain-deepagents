@@ -3,6 +3,8 @@ from typing import Any, Dict, List
 from deep_agents_app.repositories import projects as project_repository
 from deep_agents_app.repositories import sessions as session_repository
 from deep_agents_app.services import workspace
+from deep_agents_app.services.artifacts import prepare_response_artifacts
+from deep_agents_app.services.sessions import get_session
 
 
 def list_projects():
@@ -18,7 +20,7 @@ def rename_project(project_id: str, name: str):
 
 
 def session_detail(user_id: str, project_id: str, session_id: str):
-    session = workspace.get_session(user_id, project_id, session_id)
+    session = get_session(user_id, project_id, session_id)
     with workspace.get_db_connection() as connection:
         rows = session_repository.messages(connection, user_id, project_id, session_id)
         artifact_rows = session_repository.artifacts(connection, user_id, project_id, session_id)
@@ -30,7 +32,7 @@ def session_detail(user_id: str, project_id: str, session_id: str):
     for row in rows:
         message = dict(row)
         if message["role"] == "assistant":
-            message["content"] = workspace.prepare_response_artifacts(
+            message["content"] = prepare_response_artifacts(
                 user_id, project_id, message["content"], artifacts_by_run.get(message["run_id"], [])
             )
             message["duration_seconds"] = workspace.duration_seconds_between(
@@ -44,7 +46,7 @@ def session_detail(user_id: str, project_id: str, session_id: str):
 
 
 def session_runs(user_id: str, project_id: str, session_id: str):
-    workspace.get_session(user_id, project_id, session_id)
+    get_session(user_id, project_id, session_id)
     with workspace.get_db_connection() as connection:
         return [dict(row) for row in session_repository.runs(connection, user_id, project_id, session_id)]
 

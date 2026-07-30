@@ -5,17 +5,22 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from deep_agents_app.api.routers import auth_router, chat_router, projects_router, sessions_router, settings_router
+from deep_agents_app.runtime import engine
+from deep_agents_app.services import sessions as sessions_service
+from deep_agents_app.services import uploads as uploads_service
 from deep_agents_app.services import workspace
 
 
 @asynccontextmanager
 async def app_lifespan(_: FastAPI):
     workspace.init_db()
-    workspace.recover_interrupted_runs()
+    sessions_service.recover_interrupted_runs()
+    uploads_service.prune_expired_uploads()
+    uploads_service.prune_stale_upload_staging()
     try:
         yield
     finally:
-        workspace.invalidate_all_agents()
+        await engine.aclose_all_agents()
 
 
 async def security_headers(request: Request, call_next):
@@ -36,6 +41,9 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+SPA_RESERVED_PREFIXES = ("api/", "static/")
+
+
 def frontend_index():
     index_path = workspace.STATIC_DIR / "dist" / "index.html"
     if not index_path.is_file():
@@ -46,6 +54,18 @@ def frontend_index():
     return FileResponse(index_path)
 
 
+def frontend_shell(full_path: str = ""):
+    """Serve the single-page application shell for any client-side route.
+
+    Registered last, so every declared API route and the static mount match
+    first. A path under a reserved prefix stays a 404: answering a mistyped API
+    request with HTML would look to the caller like a successful response.
+    """
+    if full_path.startswith(SPA_RESERVED_PREFIXES):
+        raise HTTPException(status_code=404, detail="Not found")
+    return frontend_index()
+
+
 def create_app() -> FastAPI:
     application = FastAPI(title="Deep Agents Project Workspace", lifespan=app_lifespan)
     application.middleware("http")(security_headers)
@@ -54,9 +74,10 @@ def create_app() -> FastAPI:
     application.include_router(projects_router)
     application.include_router(sessions_router)
     application.include_router(chat_router)
-    application.add_api_route("/", frontend_index, methods=["GET"], include_in_schema=False)
-    application.add_api_route("/projects/{frontend_path:path}", frontend_index, methods=["GET"], include_in_schema=False)
     application.mount("/static", StaticFiles(directory=workspace.STATIC_DIR), name="static")
+    application.add_api_route(
+        "/{full_path:path}", frontend_shell, methods=["GET"], include_in_schema=False
+    )
     return application
 
 

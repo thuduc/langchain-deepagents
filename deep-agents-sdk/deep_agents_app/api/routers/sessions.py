@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse
 from deep_agents_app.api.dependencies import get_current_user
 from deep_agents_app.domain import CurrentUser
 from deep_agents_app.schemas import SessionCreateRequest
+from deep_agents_app.services import sessions as sessions_service
 from deep_agents_app.services import workspace
 from deep_agents_app.services import queries
 
@@ -14,13 +15,13 @@ router = APIRouter(prefix="/api", tags=["sessions"])
 @router.get("/projects/{project_id}/sessions")
 def list_sessions(project_id: str, user: CurrentUser = Depends(get_current_user)):
     workspace.get_project(project_id)
-    return {"sessions": workspace.list_project_sessions(user.id, project_id)}
+    return {"sessions": sessions_service.list_project_sessions(user.id, project_id)}
 
 
 @router.post("/projects/{project_id}/sessions")
 def create_session(project_id: str, request: SessionCreateRequest, user: CurrentUser = Depends(get_current_user)):
-    session = workspace.create_session(user.id, project_id, request.title)
-    return {"session": session, "sessions": workspace.list_project_sessions(user.id, project_id)}
+    session = sessions_service.create_session(user.id, project_id, request.title)
+    return {"session": session, "sessions": sessions_service.list_project_sessions(user.id, project_id)}
 
 
 @router.get("/projects/{project_id}/sessions/{session_id}")
@@ -35,8 +36,8 @@ def list_session_runs(project_id: str, session_id: str, user: CurrentUser = Depe
 
 @router.delete("/projects/{project_id}/sessions/{session_id}")
 def delete_session(project_id: str, session_id: str, user: CurrentUser = Depends(get_current_user)):
-    session = workspace.get_session(user.id, project_id, session_id)
-    workspace.delete_session_resources(user.id, project_id, session_id, session["thread_id"])
+    session = sessions_service.get_session(user.id, project_id, session_id)
+    sessions_service.delete_session_resources(user.id, project_id, session_id, session["thread_id"])
     return {"deleted": True}
 
 

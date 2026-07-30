@@ -55,7 +55,7 @@ class ApiContractTests(unittest.TestCase):
     def test_openapi_operations_remain_stable(self):
         schema = app.openapi()
         operations = {
-            (method.upper(), path.replace("{media_path}", "{media_path}"))
+            (method.upper(), path)
             for path, methods in schema["paths"].items()
             for method in methods
         }

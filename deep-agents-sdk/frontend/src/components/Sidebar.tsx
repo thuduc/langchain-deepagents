@@ -108,7 +108,7 @@ export function Sidebar(props: SidebarProps) {
       <button className="icon-button mobile-close-btn" onClick={props.onMobileClose} aria-label="Close sidebar"><Icon name="close" /></button>
     </div>
     <section className="nav-section projects-section">
-      <div className="section-header"><span>Projects</span>{props.isAdmin ? <button className="icon-button" onClick={props.onAddProject} title="Import new project" aria-label="Import new project"><Icon name="add" /></button> : null}</div>
+      <div className="section-header"><span>Projects</span>{props.isAdmin ? <button className="icon-button" onClick={props.onAddProject} title="New project" aria-label="New project"><Icon name="add" /></button> : null}</div>
       <div className="list">
         {props.projects.length ? props.projects.map((project) => {
           const isExpanded = props.expanded.has(project.id);

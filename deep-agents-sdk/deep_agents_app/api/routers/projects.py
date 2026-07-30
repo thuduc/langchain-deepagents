@@ -13,6 +13,10 @@ from deep_agents_app.domain import CurrentUser
 from deep_agents_app.schemas import ContentImportRequest, ProjectCreateRequest, ProjectFolderCreateRequest, ProjectImportRequest, ProjectUpdateRequest
 from deep_agents_app.services import project_files, workspace
 from deep_agents_app.services import queries
+from deep_agents_app.runtime import engine
+from deep_agents_app.services import project_admin
+from deep_agents_app.services import sessions as sessions_service
+from deep_agents_app.services import uploads as uploads_service
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -62,7 +66,7 @@ def update_project(project_id: str, request: ProjectUpdateRequest, user: Current
     if not name:
         raise HTTPException(status_code=400, detail="Project name cannot be empty")
     project = queries.rename_project(project_id, name)
-    workspace.invalidate_project_agent(project_id)
+    engine.invalidate_project_agent(project_id)
     workspace.add_audit_event(user.id, "project.update", project_id, {"name": name})
     return {"project": project}
 
@@ -76,7 +80,7 @@ def get_project(project_id: str, _: CurrentUser = Depends(get_current_user)):
 
 @router.get("/projects/{project_id}/isolation")
 def project_isolation(project_id: str, user: CurrentUser = Depends(require_project_admin)):
-    return {"audit": workspace.project_isolation_audit(user.id, project_id)}
+    return {"audit": project_admin.project_isolation_audit(user.id, project_id)}
 
 
 @router.delete("/projects/{project_id}")
@@ -84,7 +88,7 @@ def delete_project(project_id: str, user: CurrentUser = Depends(require_project_
     project = workspace.get_project(project_id)
     project_root = workspace.ensure_child_path(workspace.get_projects_dir(), Path(project["path"]))
     workspace.add_audit_event(user.id, "project.delete.requested", project_id, {"name": project["name"]})
-    workspace.delete_project_resources(project_id, project_root)
+    project_admin.delete_project_resources(project_id, project_root)
     return {"deleted": True}
 
 
@@ -253,11 +257,11 @@ def delete_project_entry(
 
 @router.delete("/projects/{project_id}/contents")
 def delete_project_contents(project_id: str, user: CurrentUser = Depends(require_project_admin)):
-    workspace.ensure_no_active_project_runs(project_id)
+    sessions_service.ensure_no_active_project_runs(project_id)
     project_root = workspace.get_project_root(project_id)
     workspace.reset_project_contents_transactional(project_root)
     workspace.touch_project(project_id, bump_revision=True)
-    workspace.invalidate_project_agent(project_id)
+    engine.invalidate_project_agent(project_id)
     workspace.add_audit_event(user.id, "project.contents.delete", project_id)
     return {"deleted": True}
 
@@ -276,8 +280,8 @@ async def upload_preview(file: UploadFile = File(...), user: CurrentUser = Depen
                 if total > 250 * 1024 * 1024:
                     raise HTTPException(status_code=400, detail="ZIP upload exceeds 250MB limit")
                 destination.write(chunk)
-        preview = workspace.inspect_zip(zip_path)
-        workspace.record_upload_preview(user.id, token, zip_path)
+        preview = uploads_service.inspect_zip(zip_path)
+        uploads_service.record_upload_preview(user.id, token, zip_path)
     except Exception:
         zip_path.unlink(missing_ok=True)
         raise
@@ -286,14 +290,14 @@ async def upload_preview(file: UploadFile = File(...), user: CurrentUser = Depen
 
 @router.post("/projects/import")
 def import_project(request: ProjectImportRequest, user: CurrentUser = Depends(require_project_admin)):
-    zip_path = workspace.upload_path_for_token(user.id, request.upload_token, consume=True)
+    zip_path = uploads_service.upload_path_for_token(user.id, request.upload_token, consume=True)
     project: Optional[Dict[str, Any]] = None
     try:
         project = workspace.create_project_record(request.name, user.id)
-        workspace.extract_zip(zip_path, Path(project["path"]), request.mode)
+        uploads_service.extract_zip(zip_path, Path(project["path"]), request.mode)
         workspace.touch_project(project["id"], bump_revision=True)
         workspace.validate_project_skills(project["id"])
-        workspace.invalidate_project_agent(project["id"])
+        engine.invalidate_project_agent(project["id"])
         workspace.add_audit_event(user.id, "project.import", project["id"], {"mode": request.mode})
         return {"project": workspace.public_project(workspace.get_project(project["id"]))}
     except Exception:
@@ -305,24 +309,24 @@ def import_project(request: ProjectImportRequest, user: CurrentUser = Depends(re
                 conn.execute("DELETE FROM projects WHERE id = ?", (project["id"],))
         raise
     finally:
-        workspace.cleanup_upload_preview(request.upload_token, zip_path)
+        uploads_service.cleanup_upload_preview(request.upload_token, zip_path)
 
 
 @router.post("/projects/{project_id}/contents/import")
 def import_project_contents(project_id: str, request: ContentImportRequest, user: CurrentUser = Depends(require_project_admin)):
     with workspace.project_content_lock(project_id):
-        workspace.ensure_no_active_project_runs(project_id)
+        sessions_service.ensure_no_active_project_runs(project_id)
         project_root = workspace.get_project_root(project_id)
-        zip_path = workspace.upload_path_for_token(user.id, request.upload_token, consume=True)
+        zip_path = uploads_service.upload_path_for_token(user.id, request.upload_token, consume=True)
         try:
-            workspace.extract_zip(zip_path, project_root, request.mode)
+            uploads_service.extract_zip(zip_path, project_root, request.mode)
             workspace.touch_project(project_id, bump_revision=True)
             workspace.validate_project_skills(project_id)
-            workspace.invalidate_project_agent(project_id)
+            engine.invalidate_project_agent(project_id)
             workspace.add_audit_event(user.id, "project.contents.import", project_id, {"mode": request.mode})
             return {"project": workspace.public_project(workspace.get_project(project_id)), "items": workspace.list_project_files(project_root)}
         finally:
-            workspace.cleanup_upload_preview(request.upload_token, zip_path)
+            uploads_service.cleanup_upload_preview(request.upload_token, zip_path)
 
 
 @router.get("/projects/{project_id}/media/{media_path:path}")

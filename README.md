@@ -51,6 +51,8 @@ langchain-deepagents/
 
 Application logic lives under `deep_agents_app`; `server.py` deliberately contains only the stable Uvicorn import path. Runtime databases, generated outputs, frontend build output, caches, and local environment files are intentionally excluded from Git.
 
+Modules are layered and the dependency graph is acyclic, so every module can be imported on its own. `services/workspace.py` is the lowest layer and holds shared configuration, storage roots, identity, and the project registry; it must not import another service or runtime module. Work that spans layers — deleting a project, or applying a settings change — lives in a router or in `services/project_admin.py`. Because tests rebind the storage roots to temporary directories, other modules read them as attributes (`state.ARTIFACTS_DIR`) and never import them by value. `tests/test_layering.py` enforces both rules.
+
 ## Setup
 
 Create the SDK-local virtual environment and install constrained Python dependencies:
@@ -178,6 +180,8 @@ Run workspaces and temporary generated code are deleted after each run. Register
 
 `MAX_CONCURRENT_RUNS_PER_USER` limits simultaneous tasks per authenticated user; the default is `3`.
 
+Prompt handling is asynchronous. `POST /api/chat` and `POST /api/chat/stream` await the agent through LangGraph's `ainvoke` and `astream`, so a run waiting on the model holds no server worker thread and cannot delay ordinary requests such as project listings or artifact downloads. This requires an async checkpoint store, so agent checkpoints use `AsyncSqliteSaver` over `aiosqlite`; the blocking SQLite and filesystem work around a run is offloaded to the thread pool instead. Generated Python still runs synchronously inside its own tool call, bounded by `PYTHON_EXECUTION_TIMEOUT_SECONDS`.
+
 ## Local development
 
 Enable the same-port development identity popup in `.env`:
@@ -301,6 +305,10 @@ Private generated files:
 - `GET /api/artifacts/{artifact_id}`
 
 Session and artifact lookups always include the authenticated internal user ID. Unknown and non-owned private resource IDs both return `404`.
+
+Any other `GET` path returns the React application shell so that client-side routes and bookmarks resolve on a full page load. Paths under `/api/` and `/static/` are excluded: an unknown one returns a JSON `404` rather than HTML, so a mistyped API request is never mistaken for a successful response.
+
+`MAX_SESSIONS_PER_PROJECT` is enforced only on write paths: creating a chat, and lowering the limit through `PUT /api/settings`. Reading a session list never deletes a chat, so opening the workspace cannot destroy history.
 
 ## Project skills
 

@@ -339,7 +339,14 @@ def artifact_path_variants(artifact: Dict[str, Any]) -> List[str]:
     storage_parts = PurePosixPath(storage_key).parts
     if len(storage_parts) >= 5:
         run_relative_path = Path(*storage_parts[4:])
-        variants.add(run_relative_path.as_posix())
+        if len(storage_parts) > 5:
+            # A multi-segment path such as "outputs/result.csv" describes the
+            # private run layout and must go. A bare file name must not: it
+            # reveals nothing the download card does not already show, and
+            # cutting it out of a sentence leaves wreckage like "the load_hpi()
+            # function in loads the CSV". A line that is *only* a file name is
+            # still dropped, by artifact_label_only.
+            variants.add(run_relative_path.as_posix())
         work_path = state.WORK_DIR.joinpath(*storage_parts[:4], run_relative_path)
         variants.update({str(work_path), work_path.as_posix()})
     variants.update(f"file://{value}" for value in list(variants) if value.startswith("/"))
@@ -390,31 +397,21 @@ ARTIFACT_SECTION_WORDS = {
     "visualization",
     "visualizations",
 }
-ARTIFACT_ANNOUNCEMENT_WORDS = {
-    "above",
-    "available",
-    "below",
-    "created",
-    "download",
-    "downloaded",
-    "exported",
-    "generated",
-    "here",
-    "saved",
-    "written",
-}
 
 
 def artifact_placeholder_line(line: str, artifacts: List[Dict[str, Any]]) -> bool:
+    """Report whether a line carries no information once its paths are stripped.
+
+    Only blank lines, horizontal rules, and bare artifact labels qualify. This
+    deliberately does not try to recognise prose: matching sentences on their
+    vocabulary previously deleted real analysis such as "The generated plot
+    shows seasonality below", which is exactly the narration the supervisor
+    prompt asks the model to produce.
+    """
     plain = re.sub(r"^[\s#>*_`-]+|[\s*_`]+$", "", line).strip()
     if not plain or re.fullmatch(r"[-*_]{3,}", plain):
         return True
-    if artifact_label_only(plain, artifacts):
-        return True
-    words = set(re.findall(r"[a-z0-9]+", plain.lower()))
-    return bool(words & ARTIFACT_SECTION_WORDS) and bool(
-        words & ARTIFACT_ANNOUNCEMENT_WORDS
-    )
+    return artifact_label_only(plain, artifacts)
 
 
 def remove_empty_artifact_sections(text: str, artifacts: List[Dict[str, Any]]) -> str:
@@ -511,6 +508,12 @@ def select_response_artifacts(
     ]
 
 
+def bare_artifact_name_line(line: str, artifact_names: set[str]) -> bool:
+    """Report whether a line consists solely of a generated file's name."""
+    plain = re.sub(r"^[\s#>*_`-]+|[\s*_`]+$", "", line).strip().rstrip(":")
+    return bool(plain) and plain.lower() in artifact_names
+
+
 def strip_internal_artifact_paths(text: str, artifacts: List[Dict[str, Any]]) -> str:
     """Remove registered file references before rebuilding the artifact section."""
     if not artifacts:
@@ -530,10 +533,23 @@ def strip_internal_artifact_paths(text: str, artifacts: List[Dict[str, Any]]) ->
     # version and reconstruct it from the current artifact records below.
     text = GENERATED_ARTIFACTS_HEADING_RE.split(text, maxsplit=1)[0].rstrip()
 
+    artifact_names = {
+        str(artifact.get("display_name", "")).strip().lower()
+        for artifact in artifacts
+        if str(artifact.get("display_name", "")).strip()
+    }
+
     output: List[str] = []
     for line in text.splitlines():
         matching = [(path, name) for path, name in path_entries if path in line]
         if not matching:
+            # A line that is nothing but a file name is a leftover label. This is
+            # an exact match on the name, not a guess from vocabulary, so prose
+            # that merely mentions the file is left alone.
+            if bare_artifact_name_line(line, artifact_names):
+                while output and not output[-1].strip():
+                    output.pop()
+                continue
             output.append(line)
             continue
 
@@ -549,8 +565,22 @@ def strip_internal_artifact_paths(text: str, artifacts: List[Dict[str, Any]]) ->
                 re.IGNORECASE,
             )
             cleaned = html_media.sub("", cleaned)
+            # Take any inline emphasis wrapper with the path. Removing the path
+            # alone strands its markers, and the reader sees a literal `` or
+            # **** where the file name used to be. Longer markers first, so that
+            # ** is consumed before *.
+            for marker in ("`", "**", "__", "*", "_"):
+                escaped = re.escape(marker)
+                cleaned = re.sub(
+                    rf"{escaped}\s*{re.escape(path)}\s*{escaped}", "", cleaned
+                )
             cleaned = cleaned.replace(path, "")
 
+        # A line that opened with the file name is left starting on its
+        # separator, e.g. "— reusable Python module".
+        cleaned = re.sub(r"^(\s*(?:[-*+]\s+)?)[—–-]\s+", r"\1", cleaned)
+        # Close the gap the removal opened, without touching leading indentation.
+        cleaned = re.sub(r"(?<=\S)[ \t]{2,}", " ", cleaned)
         cleaned = re.sub(r"[ \t]+([,.;:])", r"\1", cleaned).rstrip()
 
         if artifact_label_only(cleaned, artifacts):

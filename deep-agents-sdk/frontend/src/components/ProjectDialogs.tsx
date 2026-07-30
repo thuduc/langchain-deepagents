@@ -646,28 +646,82 @@ export function ImportDialog({ open, targetProject, newProject, onClose, onCompl
     catch (error) { setStatus(error instanceof Error ? error.message : "Unable to inspect ZIP"); }
     finally { setBusy(false); }
   };
-  const importContents = async () => {
-    if (!preview || (newProject && !projectName.trim())) return;
-    setBusy(true); setStatus("Importing…");
+  // A new project may start empty or from a ZIP; importing into an existing
+  // project always needs one.
+  const canSubmit = newProject ? Boolean(projectName.trim()) : Boolean(preview);
+  const submit = async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    setStatus(preview ? "Importing…" : "Creating…");
     const mode = !newProject && replaceExisting ? "replace" : "merge";
     try {
-      const result = newProject
-        ? await api<{ project: Project }>("/api/projects/import", { method: "POST", body: JSON.stringify({ name: projectName.trim(), upload_token: preview.upload_token, mode }) })
-        : await api<{ project: Project }>(`/api/projects/${targetProject?.id}/contents/import`, { method: "POST", body: JSON.stringify({ upload_token: preview.upload_token, mode }) });
+      let result: { project: Project };
+      if (newProject && !preview) {
+        result = await api<{ project: Project }>("/api/projects", { method: "POST", body: JSON.stringify({ name: projectName.trim() }) });
+      } else if (newProject) {
+        result = await api<{ project: Project }>("/api/projects/import", { method: "POST", body: JSON.stringify({ name: projectName.trim(), upload_token: preview!.upload_token, mode }) });
+      } else {
+        result = await api<{ project: Project }>(`/api/projects/${targetProject?.id}/contents/import`, { method: "POST", body: JSON.stringify({ upload_token: preview!.upload_token, mode }) });
+      }
       await onComplete(result.project); resetAndClose();
-    } catch (error) { setStatus(error instanceof Error ? error.message : "Import failed"); }
+    } catch (error) { setStatus(error instanceof Error ? error.message : newProject ? "Could not create the project" : "Import failed"); }
     finally { setBusy(false); }
   };
-  return <Modal open={open} title={newProject ? "Import New Project" : "Import Project Contents"} subtitle={targetProject?.name} onClose={resetAndClose} actions={<><button className="secondary-action" onClick={resetAndClose}>Cancel</button><button className="primary-action" disabled={busy || !preview || (newProject && !projectName.trim())} onClick={importContents}>Import</button></>}>
+  return <Modal open={open} title={newProject ? "New Project" : "Import Project Contents"} subtitle={targetProject?.name} onClose={resetAndClose} blocking={busy} actions={<><button className="secondary-action" type="button" disabled={busy} onClick={resetAndClose}>Cancel</button><button className="primary-action" type="button" disabled={busy || !canSubmit} onClick={() => { void submit(); }}>{newProject ? "Create project" : "Import"}</button></>}>
     <div className="settings-form">
-      {newProject ? <label className="settings-field"><span>Project name</span><input value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label> : null}
+      {newProject ? <label className="settings-field"><span>Project name</span><input autoFocus value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. Mortgage Analytics" /></label> : null}
       {!newProject && contentSummary?.has_content ? <label className="import-replace-option">
         <input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />
         <span><strong>Replace all current project content</strong><small>When selected, existing project files are removed before the ZIP is imported. Leave this unchecked to keep existing files and overwrite only matching paths.</small></span>
       </label> : null}
       <input ref={input} type="file" accept=".zip,application/zip" hidden onChange={(event) => { void previewFile(event.target.files?.[0]); }} />
-      {!preview ? <button className="upload-dropzone" onClick={() => input.current?.click()} disabled={busy}>Choose a ZIP file</button> : <><p className="import-preview-summary">{preview.entry_count} entries, {formatBytes(preview.total_size)} extracted</p><ImportFileList items={preview.entries} /></>}
+      {!preview ? <button className="upload-dropzone" type="button" onClick={() => input.current?.click()} disabled={busy}>{newProject ? "Choose a ZIP file (optional)" : "Choose a ZIP file"}</button> : <><p className="import-preview-summary">{preview.entry_count} entries, {formatBytes(preview.total_size)} extracted</p><ImportFileList items={preview.entries} /></>}
+      {newProject && !preview ? <p className="project-entry-help">Leave the ZIP empty to start with an empty <code>data/</code> and <code>skills/</code> project.</p> : null}
       <p className="settings-status" role="status">{status}</p>
+    </div>
+  </Modal>;
+}
+
+export function RenameProjectDialog({ project, open, onClose, onRenamed }: { project?: Project; open: boolean; onClose: () => void; onRenamed: () => Promise<void> }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { setName(project?.name || ""); setError(""); }, [project, open]);
+  const submit = async () => {
+    const trimmed = name.trim();
+    if (!project || !trimmed || trimmed === project.name) { onClose(); return; }
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/projects/${encodeURIComponent(project.id)}`, { method: "PUT", body: JSON.stringify({ name: trimmed }) });
+      await onRenamed();
+      onClose();
+    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to rename the project"); }
+    finally { setBusy(false); }
+  };
+  return <Modal open={open} title="Rename project" subtitle={project?.name} onClose={onClose} className="project-entry-modal" blocking={busy} actions={<><button className="secondary-action" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-action" type="submit" form="rename-project-form" disabled={busy || !name.trim()}>{busy ? "Saving…" : "Save"}</button></>}>
+    <form id="rename-project-form" className="project-entry-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+      <label className="settings-field"><span>Project name</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} maxLength={255} /></label>
+      <p className="project-entry-error" role="alert">{error}</p>
+    </form>
+  </Modal>;
+}
+
+export function ConfirmDialog({ open, title, subtitle, message, confirmLabel, busyLabel, onConfirm, onClose }: { open: boolean; title: string; subtitle?: string; message: string; confirmLabel: string; busyLabel: string; onConfirm: () => Promise<void>; onClose: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { if (open) setError(""); }, [open]);
+  const confirm = async () => {
+    setBusy(true);
+    setError("");
+    try { await onConfirm(); onClose(); }
+    catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The action could not be completed"); }
+    finally { setBusy(false); }
+  };
+  return <Modal open={open} title={title} subtitle={subtitle} onClose={onClose} className="project-entry-modal" blocking={busy} actions={<><button className="secondary-action" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="secondary-action danger-action" type="button" disabled={busy} onClick={() => { void confirm(); }}>{busy ? busyLabel : confirmLabel}</button></>}>
+    <div className="project-entry-form">
+      <p className="project-delete-warning">{message}</p>
+      <p className="project-entry-error" role="alert">{error}</p>
     </div>
   </Modal>;
 }

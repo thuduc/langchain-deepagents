@@ -2,6 +2,7 @@ import hashlib
 import re
 import shutil
 import sqlite3
+import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -21,8 +22,41 @@ from deep_agents_app.services.workspace import (
 )
 
 
+STAGING_SUBDIRECTORIES = ("content-edits", "project-exports")
+STAGING_MAX_AGE_SECONDS = 60 * 60
+
+
 def upload_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def prune_stale_upload_staging(max_age_seconds: int = STAGING_MAX_AGE_SECONDS) -> None:
+    """Reclaim staged uploads and export archives left by interrupted requests.
+
+    Both are normally removed by the request that created them, but a client
+    disconnect can skip that cleanup. Neither is recorded in ``upload_previews``,
+    so without this sweep nothing would ever reclaim the space.
+    """
+    root = state.TMP_UPLOADS_DIR
+    if not root.exists():
+        return
+    cutoff = time.time() - max_age_seconds
+    for user_dir in root.iterdir():
+        if user_dir.is_symlink() or not user_dir.is_dir():
+            continue
+        for staging_name in STAGING_SUBDIRECTORIES:
+            staging_dir = user_dir / staging_name
+            if staging_dir.is_symlink() or not staging_dir.is_dir():
+                continue
+            for path in staging_dir.iterdir():
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    if path.stat().st_mtime > cutoff:
+                        continue
+                    ensure_child_path(root, path).unlink(missing_ok=True)
+                except (OSError, HTTPException) as exc:
+                    logger.warning("Could not remove stale staged file %s: %s", path, exc)
 
 
 def prune_expired_uploads() -> None:

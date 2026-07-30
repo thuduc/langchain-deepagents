@@ -76,7 +76,6 @@ def development_login(login: DevelopmentLoginRequest, request: Request, response
         path="/",
     )
     identity = decode_development_token(token, workspace.DEVELOPMENT_SIGNING_SECRET)
-    workspace.init_db()
     return current_user_response(workspace.upsert_current_user(identity))
 
 

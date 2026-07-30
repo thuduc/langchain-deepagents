@@ -1,26 +1,24 @@
 import shutil
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
 from deep_agents_app.domain import RunContext
+from deep_agents_app.runtime.checkpoints import delete_checkpoint_thread
 from deep_agents_app.services import workspace as state
 from deep_agents_app.services.workspace import (
+    DEFAULT_MAX_SESSIONS_PER_PROJECT,
     bounded_env_int,
+    coerce_max_sessions,
     create_run_context,
     ensure_child_path,
+    get_app_settings,
     get_db_connection,
     get_project,
     logger,
-    prune_project_sessions,
     utc_now,
 )
-
-
-def _delete_checkpoint_thread(thread_id: str) -> None:
-    from deep_agents_app.runtime.engine import delete_checkpoint_thread as runtime_delete_checkpoint_thread
-    runtime_delete_checkpoint_thread(thread_id)
 
 
 def session_thread_id(user_id: str, project_id: str, session_id: str) -> str:
@@ -76,6 +74,73 @@ def get_session(user_id: str, project_id: str, session_id: str) -> Dict[str, Any
     if not row:
         raise HTTPException(status_code=404, detail="Chat session not found")
     return dict(row)
+
+
+def prune_project_sessions(
+    user_id: str,
+    project_id: str,
+    max_sessions: Optional[int] = None,
+) -> None:
+    """Enforce the retention cap for one user and project.
+
+    This deletes chats and their artifacts, so it must only run on write paths
+    such as creating a chat or lowering the configured limit. Read endpoints
+    must never call it.
+    """
+    limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
+    limit = coerce_max_sessions(limit, DEFAULT_MAX_SESSIONS_PER_PROJECT)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT cs.id, cs.thread_id FROM chat_sessions AS cs
+            WHERE cs.user_id = ? AND cs.project_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_runs AS tr
+                  WHERE tr.session_id = cs.id AND tr.status = 'running'
+              )
+            ORDER BY cs.updated_at DESC, cs.created_at DESC, cs.id DESC
+            """,
+            (user_id, project_id),
+        ).fetchall()
+    for row in rows[limit:]:
+        delete_session_resources(user_id, project_id, row["id"], row["thread_id"])
+
+
+def prune_all_project_sessions(max_sessions: Optional[int] = None) -> None:
+    limit = max_sessions if max_sessions is not None else get_app_settings()["max_sessions_per_project"]
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT user_id, project_id FROM chat_sessions"
+        ).fetchall()
+    for row in rows:
+        prune_project_sessions(row["user_id"], row["project_id"], limit)
+
+
+def list_project_sessions(user_id: str, project_id: str) -> List[Dict[str, Any]]:
+    """Read one user's chats for a project. This never deletes anything."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT cs.*,
+                   (
+                       SELECT tr.id FROM task_runs AS tr
+                       WHERE tr.session_id = cs.id AND tr.user_id = cs.user_id
+                         AND tr.status = 'running'
+                       ORDER BY tr.created_at DESC LIMIT 1
+                   ) AS active_run_id,
+                   (
+                       SELECT tr.latest_status FROM task_runs AS tr
+                       WHERE tr.session_id = cs.id AND tr.user_id = cs.user_id
+                         AND tr.status = 'running'
+                       ORDER BY tr.created_at DESC LIMIT 1
+                   ) AS active_run_status
+            FROM chat_sessions AS cs
+            WHERE cs.user_id = ? AND cs.project_id = ?
+            ORDER BY cs.updated_at DESC, cs.created_at DESC, cs.id DESC
+            """,
+            (user_id, project_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def add_chat_message(
@@ -141,16 +206,10 @@ def create_task_run(
         run_id = uuid.uuid4().hex
         now = utc_now()
         with get_db_connection() as conn:
-            active_count = conn.execute(
-                "SELECT COUNT(*) AS count FROM task_runs WHERE user_id = ? AND status = 'running'",
-                (user_id,),
-            ).fetchone()["count"]
-            concurrent_limit = bounded_env_int("MAX_CONCURRENT_RUNS_PER_USER", 3, 1, 20)
-            if active_count >= concurrent_limit:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Concurrent task limit reached for this user",
-                )
+            # The busy-chat check comes first because it is the more specific
+            # diagnosis. Checking the account-wide limit first meant a user at
+            # the limit who resubmitted into an already-busy chat was told to
+            # wait for their other chats, which is not the actual problem.
             active = conn.execute(
                 """
                 SELECT 1 FROM task_runs
@@ -163,6 +222,16 @@ def create_task_run(
                 raise HTTPException(
                     status_code=409,
                     detail="This chat already has a task running",
+                )
+            active_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM task_runs WHERE user_id = ? AND status = 'running'",
+                (user_id,),
+            ).fetchone()["count"]
+            concurrent_limit = bounded_env_int("MAX_CONCURRENT_RUNS_PER_USER", 3, 1, 20)
+            if active_count >= concurrent_limit:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Concurrent task limit reached for this user",
                 )
             conn.execute(
                 """
@@ -311,7 +380,7 @@ def delete_session_resources(
         )
         cleanup_run_work(context)
 
-    _delete_checkpoint_thread(thread_id or session["thread_id"])
+    delete_checkpoint_thread(thread_id or session["thread_id"])
     with get_db_connection() as conn:
         conn.execute(
             """
@@ -320,6 +389,7 @@ def delete_session_resources(
             """,
             (session_id, project_id, user_id),
         )
+
 
 def ensure_no_active_project_runs(project_id: str) -> None:
     with get_db_connection() as conn:

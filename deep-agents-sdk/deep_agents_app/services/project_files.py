@@ -16,7 +16,9 @@ from typing import Any, Dict, List
 
 from fastapi import HTTPException
 
+from deep_agents_app.runtime.engine import invalidate_project_agent
 from deep_agents_app.services import workspace
+from deep_agents_app.services.sessions import ensure_no_active_project_runs
 
 
 TEXT_PREVIEW_MAX_BYTES = 512 * 1024
@@ -174,13 +176,13 @@ def _commit_mutation(
     workspace.record_project_content_mutation(user_id, project_id, action, details)
     if skills_changed:
         workspace.validate_project_skills(project_id)
-        workspace.invalidate_project_agent(project_id)
+        invalidate_project_agent(project_id)
     return workspace.public_project(workspace.get_project(project_id))
 
 
 def create_folder(project_id: str, parent_path: str, name: str, user_id: str) -> Dict[str, Any]:
     with workspace.project_content_lock(project_id):
-        workspace.ensure_no_active_project_runs(project_id)
+        ensure_no_active_project_runs(project_id)
         root, parent, target = _new_child_path(project_id, parent_path, name)
         if parent == root / "skills" and not SKILL_NAME.fullmatch(target.name):
             raise HTTPException(status_code=422, detail="Top-level skill folders must use lowercase alphanumeric words separated by hyphens")
@@ -210,7 +212,7 @@ def add_file_from_staged(
     user_id: str,
 ) -> Dict[str, Any]:
     with workspace.project_content_lock(project_id):
-        workspace.ensure_no_active_project_runs(project_id)
+        ensure_no_active_project_runs(project_id)
         root, parent, target = _new_child_path(project_id, parent_path, file_name)
         if target.exists():
             raise HTTPException(status_code=409, detail="A file with this name already exists; use Replace instead")
@@ -244,7 +246,7 @@ def replace_file_from_staged(
     user_id: str,
 ) -> Dict[str, Any]:
     with workspace.project_content_lock(project_id):
-        workspace.ensure_no_active_project_runs(project_id)
+        ensure_no_active_project_runs(project_id)
         root, target = resolve_project_path(project_id, user_path, expected="file")
         _validate_entry_name(upload_name)
         if Path(upload_name).suffix.lower() != target.suffix.lower():
@@ -383,7 +385,7 @@ def export_project_archive(project_id: str, user_id: str) -> tuple[Path, str]:
 
 def delete_entry(project_id: str, user_path: str, user_id: str) -> Dict[str, Any]:
     with workspace.project_content_lock(project_id):
-        workspace.ensure_no_active_project_runs(project_id)
+        ensure_no_active_project_runs(project_id)
         root, target = resolve_project_path(project_id, user_path)
         relative = _relative_path(root, target)
         if target == root or relative in RESERVED_ROOT_DIRECTORIES:
